@@ -1,0 +1,8 @@
+﻿Model / Strategy,Scope,Recall@15px,Recall@25px,Precision,MAE,FPS,Rally Gen
+原版基线 (weights.onnx + 40px + CSRT),全视频 (0~778),55.5,56.14,59.13,111.54,7.7,吊灯/白鞋严重误报 (50+ FP)
+weights.onnx (YOLOv5s) + 模式 A (仅ROI),测试集 (390~778),33.42,33.42,58.3,130.52,3.3,严重失准 (未训练ROI小球)
+weights.onnx (YOLOv5s) + 模式 B (ROI+MOG2+KF),测试集 (390~778),54.5,60.41,67.14,55.12,3.5,MOG2抑制了部分吊灯
+微调 YOLOv8n + 模式 A (仅ROI),测试集 (390~778),78.92,78.92,100.0,1.61,39.3,Play: 2 balls | Lights FP: 0 (None/Immune)
+微调 YOLOv8n + 模式 B (ROI+MOG2+KF),测试集 (390~778),61.18,68.12,74.86,22.77,40.4,Play: 2 balls | Lights FP: 0 (None/Immune)
+微调 YOLO11n + 模式 A (仅ROI),测试集 (390~778),83.55,83.55,99.69,4.78,38.1,Play: 21 balls | Lights FP: 0 (None/Immune)
+微调 YOLO11n + 模式 B (ROI+MOG2+KF),测试集 (390~778),61.44,70.18,72.8,26.49,36.1,Play: 21 balls | Lights FP: 0 (None/Immune)

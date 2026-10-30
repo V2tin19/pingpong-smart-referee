@@ -1,0 +1,4 @@
+# 视觉推理选配依赖 (仅在需要本地运行 YOLO 推理时安装)
+-r requirements.txt
+ultralytics>=8.3.0
+torch>=2.0.0

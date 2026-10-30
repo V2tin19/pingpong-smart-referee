@@ -1,0 +1,36 @@
+# ---- Python & 编译缓存 ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- 操作系统与编辑器 ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ---- 深度学习训练与临时产物 ----
+runs/
+yolo_core/runs/
+wandb/
+*.pt.tmp
+.ultralytics_cfg/
+Ultralytics/
+
+# ---- 大体积媒体与输出文件 (严禁入库) ----
+data/*.mp4
+data/*.avi
+data/*.zip
+data/roboflow_ball_v7/
+output/
+*.mp4
+*.avi
+
+# ---- 运行日志与测试残留 ----
+*.log
+_interop/
+acl-report-*.jsonl
