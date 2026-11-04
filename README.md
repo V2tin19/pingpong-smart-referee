@@ -35,6 +35,7 @@
 2. **核心层零深度学习依赖**：`core/` 核心引擎采用标准库 + NumPy 实现，**完全不依赖 PyTorch / CUDA**。在嵌入式单板或低功耗工控机上，纯 CPU 运行速度高达 **15,000+ FPS**。
 3. **数据契约自校验**：严格实现方案 §7.1 与 §7.3 红线（漏检不得填位、坐标还原到原图、时间戳归属被预测帧），非法状态在构造时立即抛错，杜绝隐性污染。
 4. **四条参考门控，宁漏勿误**：发球准入（本方→对方落台序列，颠球=准备动作）、发球前击球校验（无球拍接触挡下）、回合内击球要求（同侧两弹夹击球=序列误拼不计分）、判分后 2s 冷却与静默默认不判分。每道门的触发计数随 `describe()["gates"]` 暴露，可量化、可消融（详见 `docs/state_machine_rules.md` 与 `docs/decisions.md` R-022）。
+5. **瞬移零容忍（感知降噪 P1）**：关联速度硬截断（隐含速度超物理上界即断轨，速度制、帧率无关）+ 确认帧后候选选择距离门控 + 可选球台地板掩码（`--reject-floor`）——检测瞬移在进入卡尔曼之前被拦下，杜绝虚假击球（R-024/R-025）。
 
 ---
 
@@ -58,18 +59,23 @@ pingpong/
 ├── examples/                     # 免视频、免模型的即用型观测测试数据
 │   ├── sample_tracknet_600f.jsonl# TrackNet 分支 600 帧真实比赛观测流
 │   └── sample_yolo_300f.jsonl    # YOLO 分支 300 帧真实比赛观测流
-├── tests/                        # 自动化测试套件 (181 项单元测试通过)
+├── tests/                        # 自动化测试套件 (198 项单元测试通过)
 │   ├── test_contracts.py         # 数据契约校验测试
-│   ├── test_state_machine.py     # 状态机判罚规则单测
-│   ├── test_trajectory_processor.py # 轨迹平滑与事件提取单测
-│   └── test_homography.py        # 物理落点解算单测
+│   ├── test_state_machine.py     # 状态机判罚规则与四条门控单测 (含生活流长会话回归)
+│   ├── test_trajectory_processor.py # 轨迹平滑、事件提取与瞬移守卫单测
+│   ├── test_homography.py        # 物理落点解算单测
+│   └── test_yolo_adapter.py      # 适配器纯逻辑单测 (地板掩码, 免 torch)
+├── tools/                        # 测量与分析工具 (需视觉环境)
+│   ├── compare_weights_benchmark.py   # 权重精度/误报基准对比 (对照官方真值)
+│   ├── analyze_gt_envelope.py         # 真值包络与速度分布 (掩码/截断安全边界)
+│   └── analyze_fp_locations.py        # 误检位置/置信度/bbox 尺寸分析 (降噪依据)
 ├── docs/                         # 项目技术文档规范
 │   ├── hardware_interface.md     # 【重点】硬件与外设对接规范 (相机/按键/串口/投屏)
 │   ├── data_contract.md          # 统一数据契约 (§7.1 与 §7.4 详细定义)
 │   ├── state_machine_rules.md    # 6 状态机流转图与判罚规则细则
 │   ├── gates_validation.md       # 四条参考门控的实现与验证记录 (Test4 复放对照)
 │   ├── proposal_review.md        # 《状态机修改方案》(参考文档) 评审意见：采纳/暂缓/不采纳及理由
-│   ├── decisions.md              # 22 条工程实现决策与风险记录 (R-001 ~ R-022)
+│   ├── decisions.md              # 25 条工程实现决策与风险记录 (R-001 ~ R-025)
 │   └── upstream/                 # 组长下发原始方案 (只读参考)
 ├── run_referee.py                # 系统统一运行入口
 ├── requirements.txt              # 基础运行环境 (仅 numpy + opencv)
@@ -138,7 +144,7 @@ python run_referee.py \
 ### 4. 运行完整自动化测试
 ```bash
 python -m unittest discover -s tests -p "test_*.py"
-# 预期输出：Ran 181 tests ... OK
+# 预期输出：Ran 198 tests ... OK
 ```
 
 ---
