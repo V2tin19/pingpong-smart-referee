@@ -629,5 +629,117 @@ class TestProcessorContract(unittest.TestCase):
         self.assertTrue(proc.is_tracking)
 
 
+# ---------------------------------------------------------------------------
+# 感知降噪 P1-3：关联速度硬截断（单帧位移硬截断，Test4 报告 §四.1 第 3 项）
+# ---------------------------------------------------------------------------
+class TestAssociationJumpGuard(unittest.TestCase):
+    """新观测相对上一真实观测的隐含速度超过物理上界 → 断轨，不喂卡尔曼。
+
+    上界依据：test_4 官方真值实测真球最大 **7023 px/s**（58.5 px/帧 @120fps），
+    守卫取 9000 px/s（1.28 倍余量）。它防的是"能通过候选选择的门限、
+    但物理上不可能是同一个球"的检测瞬移——瞬移会把卡尔曼速度带偏，
+    速度反转假象正是虚假 RACKET_HIT 的源头（Test4 报告问题一）。
+    """
+
+    def test_impossible_jump_breaks_track(self):
+        """78px/帧 @120fps = 9366 px/s（在 90px 候选门内、超物理上界）→ 断轨。"""
+        proc = TrajectoryEventProcessor(CALIB)
+        fps = 120.0
+        run(proc, [obs(900, 580, 0, fps=fps), obs(908, 580, 1, fps=fps),
+                   obs(916, 580, 2, fps=fps)])
+        self.assertTrue(proc.is_tracking)
+        run(proc, [obs(994, 580, 3, fps=fps)])      # 距预测 ~71px < 90px：能被选中
+        self.assertFalse(proc.is_tracking, "物理不可能的瞬移应断轨")
+        self.assertEqual(proc.stats["rejected_assoc_jumps"], 1)
+
+    def test_impossible_jump_produces_no_events(self):
+        """瞬移断轨后，后续同位置的抖动不得再拼出虚假 RACKET_HIT。"""
+        proc = TrajectoryEventProcessor(CALIB)
+        fps = 120.0
+        frames = [obs(900, 580, 0, fps=fps), obs(908, 580, 1, fps=fps),
+                  obs(916, 580, 2, fps=fps), obs(994, 580, 3, fps=fps)]
+        _, events = run(proc, frames)
+        self.assertEqual(events, [])
+
+    def test_real_fast_ball_not_broken(self):
+        """真实快球（实测上界 ~7000 px/s 量级）不得被误断。"""
+        proc = TrajectoryEventProcessor(CALIB)
+        fps = 120.0
+        run(proc, [obs(300, 580, 0, fps=fps), obs(358, 580, 1, fps=fps),
+                   obs(417, 580, 2, fps=fps)])       # ≈7000 px/s，真球实测最快档
+        self.assertTrue(proc.is_tracking)
+        self.assertEqual(proc.stats["rejected_assoc_jumps"], 0)
+
+    def test_refind_after_brief_occlusion_not_broken(self):
+        """短暂漏检（外推窗口内）后按预测位置重新找到真球 → 不得误断。
+
+        隐含速度 = 位移 / 距上一真实观测的时间差，真球重捕时 ≈ 真实球速，
+        即使位移绝对值大也必须放行（这是"速度"而非"位移"判据的意义）。
+        """
+        proc = TrajectoryEventProcessor(CALIB)
+        fps = 120.0
+        frames = [obs(700, 580, 0, fps=fps), obs(758, 580, 1, fps=fps)]
+        run(proc, frames)                            # ≈7000 px/s 起轨
+        # 漏检 6 帧（0.05s），球沿原方向飞 ~350px 后在预测附近重新出现
+        frames2 = [miss(i, fps=fps) for i in range(2, 8)]
+        run(proc, frames2)
+        run(proc, [obs(1088, 580, 8, fps=fps)])      # 隐含 ≈ (1088-758)/0.0583 ≈ 5660 px/s
+        self.assertTrue(proc.is_tracking, "真球重捕不得被守卫误断")
+
+    def test_guard_can_be_disabled(self):
+        params = ProcessorParams(max_assoc_speed_px_s=0.0)
+        proc = TrajectoryEventProcessor(CALIB, params)
+        fps = 120.0
+        run(proc, [obs(900, 580, 0, fps=fps), obs(908, 580, 1, fps=fps),
+                   obs(916, 580, 2, fps=fps), obs(994, 580, 3, fps=fps)])
+        self.assertTrue(proc.is_tracking, "关闭守卫后恢复旧行为（消融用）")
+
+
+# ---------------------------------------------------------------------------
+# 回归：确认帧之后的候选选择（距离盲选 bug，test_4 帧 4560 实测形态）
+# ---------------------------------------------------------------------------
+class TestSelectionAfterConfirmation(unittest.TestCase):
+    """刚确认跟踪的**下一帧**，候选选择必须恢复距离门控。
+
+    背景（test_4 帧 4558~4560 实测复刻）：两帧确认成功跟住真球后，
+    确认帧的 predict() 发生在卡尔曼初始化之前，``_last_prediction`` 为
+    None → 下一帧误入"未跟踪"分支：**距离盲选、只看置信度**。远处台面
+    热点（conf 0.38）赢过真球延续（conf 0.32），一步劫持刚建立的跟踪、
+    瞬移 590px/帧 —— Test4 报告"问题一"的瞬移正是从这里进来的。
+    修复：确认时把预测参考钉在确认位置。
+    """
+
+    def test_far_high_conf_fp_cannot_hijack_just_confirmed_track(self):
+        proc = TrajectoryEventProcessor(CALIB)
+        fps = 120.0
+        # 两帧确认：真球 (1526,402) → (1528,395)，速度 ~840 px/s
+        run(proc, [obs(1526, 402, 0, fps=fps), obs(1528, 395, 1, fps=fps)])
+        self.assertTrue(proc.is_tracking)
+
+        # 下一帧：远处热点 conf 0.9 vs 真球延续 conf 0.32（帧 4560 形态，
+        # 热点置信度调得更高以证明"无论多高置信度，距离门控都不放行"）
+        far = BallObservation(visible=True, center_px=(1175.0, 623.0), confidence=0.9)
+        near = BallObservation(visible=True, center_px=(1531.0, 390.0), confidence=0.32)
+        proc.update(miss(2, fps=fps), candidates=[far, near])
+
+        last = proc.trajectory[-1]
+        self.assertAlmostEqual(last.x, 1531.0, delta=45.0,
+                               msg="应选择近处真球延续，而非远处热点")
+        self.assertAlmostEqual(last.y, 390.0, delta=45.0)
+        self.assertTrue(proc.is_tracking, "跟踪不得被劫持断轨")
+        self.assertEqual(proc.stats["rejected_assoc_jumps"], 0,
+                         "候选选择在源头挡住瞬移后，速度守卫不应触发")
+
+    def test_prediction_reference_after_confirmation_is_confirmed_position(self):
+        """确认后的预测参考 = 确认位置（可从 _last_prediction 直接验证）。"""
+        proc = TrajectoryEventProcessor(CALIB)
+        fps = 120.0
+        run(proc, [obs(700, 500, 0, fps=fps), obs(708, 500, 1, fps=fps)])
+        self.assertIsNotNone(proc._last_prediction)
+        px, py = proc._last_prediction
+        self.assertAlmostEqual(px, 708.0, delta=2.0)
+        self.assertAlmostEqual(py, 500.0, delta=2.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

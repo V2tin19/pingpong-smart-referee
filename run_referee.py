@@ -169,6 +169,7 @@ def run_from_video(
     export_jsonl: Optional[str] = None,
     max_frames: Optional[int] = None,
     rules: Optional[MatchRules] = None,
+    floor_margin_px: Optional[float] = None,
 ) -> int:
     from adapters.yolo_adapter import YOLOAdapter
 
@@ -195,6 +196,7 @@ def run_from_video(
     adapter = YOLOAdapter(
         weights_path,
         calibration=calib,
+        floor_margin_px=floor_margin_px,
         imgsz=imgsz,
         conf_threshold=conf,
         strict_time=True,
@@ -305,6 +307,8 @@ def main():
     parser.add_argument("--max-frames", type=int, default=None, help="最大处理帧数限制")
     parser.add_argument("--imgsz", type=int, default=960, help="YOLO 推理尺寸 (默认: 960)")
     parser.add_argument("--conf", type=float, default=0.18, help="YOLO 检测阈值 (默认: 0.18)")
+    parser.add_argument("--reject-floor", type=float, default=None, metavar="PX",
+                        help="感知降噪：丢弃球台近边以下 PX 像素的地面检出 (Test4 建议 30；默认关)")
 
     args = parser.parse_args()
 
@@ -335,6 +339,7 @@ def main():
             output_path=args.output,
             export_jsonl=args.export_jsonl,
             max_frames=args.max_frames,
+            floor_margin_px=args.reject_floor,
         )
 
 

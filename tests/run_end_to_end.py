@@ -79,16 +79,26 @@ def main() -> int:
                     help="把逐帧观测按统一格式导出为 JSONL（供跨分支互通校验）")
     ap.add_argument("--output", default=None,
                     help="渲染带比分 UI 的视频（组长要求：左上角显示比分）")
-    ap.add_argument("--no-no-return", action="store_true",
-                    help="关闭 NO_RETURN 简化假设（球在对方半台落台后消失不判分）")
-    ap.add_argument("--no-serve-fault", action="store_true", help="关闭发球失误判罚")
+    ap.add_argument("--enable-no-return", action="store_true",
+                    help="开启 NO_RETURN 简化假设（门控 4 默认关闭：静默超时只清理证据不判分）")
+    ap.add_argument("--legacy-serving", action="store_true",
+                    help="关闭发球准入门控，退回旧版发球判分（SERVE_FAULT / 发球二跳）")
+    ap.add_argument("--no-splice-guard", action="store_true",
+                    help="关闭序列误拼守卫（同侧两弹夹击球不计分）")
+    ap.add_argument("--no-rally-hit-required", action="store_true",
+                    help="关闭回合内击球要求（门控 3a）")
     ap.add_argument("--no-out", action="store_true", help="关闭出界判罚")
+    ap.add_argument("--reject-floor", type=float, default=None, metavar="PX",
+                    help="感知降噪 P1-2：丢弃球台近边以下 PX 像素的地面检出"
+                         "（Test4 建议 30；默认关，需球台标定）")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
     sm_rules = MatchRules(
-        enable_no_return=not args.no_no_return,
-        enable_serve_fault=not args.no_serve_fault,
+        enable_no_return=args.enable_no_return,
+        enable_serve_admission=not args.legacy_serving,
+        enable_splice_guard=not args.no_splice_guard,
+        enable_rally_hit_required=not args.no_rally_hit_required,
         enable_out=not args.no_out,
     )
 
@@ -108,6 +118,7 @@ def main() -> int:
     adapter = YOLOAdapter(
         args.weights,
         calibration=calib,
+        floor_margin_px=args.reject_floor,
         imgsz=args.imgsz,
         conf_threshold=args.conf,
         strict_time=True,
@@ -119,9 +130,12 @@ def main() -> int:
     print(f"Video      : {os.path.basename(args.video)} ({w}x{h} @ {fps:.1f}fps, {n_frames} frames)")
     print(f"Calibration: {preset_name}   ROI={calib.roi_box.to_tuple()}  net_x={calib.net_x}")
     print(f"Adapter    : imgsz={args.imgsz} conf={args.conf} "
-          f"candidates={'off' if args.no_candidates else 'on'}")
-    print(f"Rules      : no_return={sm_rules.enable_no_return} "
-          f"serve_fault={sm_rules.enable_serve_fault} out={sm_rules.enable_out}")
+          f"candidates={'off' if args.no_candidates else 'on'} "
+          f"floor_mask={'off' if args.reject_floor is None else f'{args.reject_floor:g}px'}")
+    print(f"Rules      : admission={sm_rules.enable_serve_admission} "
+          f"no_return={sm_rules.enable_no_return} splice={sm_rules.enable_splice_guard} "
+          f"rally_hit={sm_rules.enable_rally_hit_required} out={sm_rules.enable_out} "
+          f"cooldown={sm_rules.score_cooldown_s}s")
     print("=" * 78)
 
     counts: Counter = Counter()
@@ -214,8 +228,9 @@ def main() -> int:
     st = processor.stats
     print("\n" + "-" * 78)
     print("[适配器]  frames=%d  measured=%d" % (st["frames"], st["measured"]))
-    print("[处理器]  confirmed_tracks=%d  rejected_static=%d  smoothed=%d  predicted=%d"
-          % (st["confirmed_tracks"], st["rejected_static"], st["smoothed"], st["predicted"]))
+    print("[处理器]  confirmed_tracks=%d  rejected_static=%d  rejected_assoc_jumps=%d  smoothed=%d  predicted=%d"
+          % (st["confirmed_tracks"], st["rejected_static"],
+             st.get("rejected_assoc_jumps", 0), st["smoothed"], st["predicted"]))
     print("[事件]   " + "  ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     print("[性能]   %.2fs  %.1f FPS" % (elapsed, n_frames / max(elapsed, 1e-9)))
 
@@ -252,6 +267,7 @@ def main() -> int:
     print("  规则贡献: " + (", ".join(f"{k}={v}" for k, v in sorted(smd["rule_counts"].items())) or "无"))
     print("  死球(未判分) %d 次   待人工确认 %d 次   判罚总数 %d"
           % (smd["dead_ball"], smd["review"], smd["decisions"]))
+    print("  门控统计: " + (", ".join(f"{k}={v}" for k, v in sorted(smd["gates"].items())) or "无"))
     print("  状态机最终状态: %s   发球方: %s" % (smd["state"], smd["server"]))
     print("=" * 78)
     return 0

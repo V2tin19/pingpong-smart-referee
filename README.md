@@ -34,6 +34,7 @@
 1. **职责严格解耦**：适配器只回答“模型看到了什么”，处理器只回答“发生了什么物理事件”，状态机只回答“谁该加分”，各层互不越权。
 2. **核心层零深度学习依赖**：`core/` 核心引擎采用标准库 + NumPy 实现，**完全不依赖 PyTorch / CUDA**。在嵌入式单板或低功耗工控机上，纯 CPU 运行速度高达 **15,000+ FPS**。
 3. **数据契约自校验**：严格实现方案 §7.1 与 §7.3 红线（漏检不得填位、坐标还原到原图、时间戳归属被预测帧），非法状态在构造时立即抛错，杜绝隐性污染。
+4. **四条参考门控，宁漏勿误**：发球准入（本方→对方落台序列，颠球=准备动作）、发球前击球校验（无球拍接触挡下）、回合内击球要求（同侧两弹夹击球=序列误拼不计分）、判分后 2s 冷却与静默默认不判分。每道门的触发计数随 `describe()["gates"]` 暴露，可量化、可消融（详见 `docs/state_machine_rules.md` 与 `docs/decisions.md` R-022）。
 
 ---
 
@@ -43,7 +44,7 @@
 pingpong/
 ├── core/                         # 裁判核心大脑（零外部深度学习依赖，纯 CPU 秒级运行）
 │   ├── schemas.py                # 统一数据契约 (FrameObservation / RefereeEvent)
-│   ├── state_machine.py          # 乒乓球 6 状态计分状态机 (含 5 条规则单独开关)
+│   ├── state_machine.py          # 6 状态计分状态机 (5 条规则 + 四条参考门控, 全部单独开关)
 │   ├── trajectory_processor.py   # 轨迹处理与事件提取 (时钟卡尔曼滤波/击球/落台)
 │   ├── geometry.py               # 球台几何与四套机位预设 (test2 / game2 / rally / plos)
 │   ├── homography.py             # 球台单应性变换 (像素坐标 ──> 真实球台 2D 厘米落点)
@@ -57,7 +58,7 @@ pingpong/
 ├── examples/                     # 免视频、免模型的即用型观测测试数据
 │   ├── sample_tracknet_600f.jsonl# TrackNet 分支 600 帧真实比赛观测流
 │   └── sample_yolo_300f.jsonl    # YOLO 分支 300 帧真实比赛观测流
-├── tests/                        # 自动化测试套件 (159 项单元测试通过)
+├── tests/                        # 自动化测试套件 (181 项单元测试通过)
 │   ├── test_contracts.py         # 数据契约校验测试
 │   ├── test_state_machine.py     # 状态机判罚规则单测
 │   ├── test_trajectory_processor.py # 轨迹平滑与事件提取单测
@@ -66,7 +67,9 @@ pingpong/
 │   ├── hardware_interface.md     # 【重点】硬件与外设对接规范 (相机/按键/串口/投屏)
 │   ├── data_contract.md          # 统一数据契约 (§7.1 与 §7.4 详细定义)
 │   ├── state_machine_rules.md    # 6 状态机流转图与判罚规则细则
-│   ├── decisions.md              # 21 条工程实现决策与风险记录 (R-001 ~ R-021)
+│   ├── gates_validation.md       # 四条参考门控的实现与验证记录 (Test4 复放对照)
+│   ├── proposal_review.md        # 《状态机修改方案》(参考文档) 评审意见：采纳/暂缓/不采纳及理由
+│   ├── decisions.md              # 22 条工程实现决策与风险记录 (R-001 ~ R-022)
 │   └── upstream/                 # 组长下发原始方案 (只读参考)
 ├── run_referee.py                # 系统统一运行入口
 ├── requirements.txt              # 基础运行环境 (仅 numpy + opencv)
@@ -107,15 +110,19 @@ python run_referee.py --jsonl examples/sample_yolo_300f.jsonl --preset game2
 ========================================================================
   [帧 0070 |  0.583s] 事件: RACKET_HIT  半台: A       ID: racket_hit_00001
   [帧 0111 |  0.925s] 事件: BOUNCE      半台: B       ID: bounce_00001
-  [帧 0111 |  0.925s] >> 判罚: P2(B) 得分 [SERVE_FAULT] 球未落发球(A)半台落在 B 0:1
   [帧 0147 |  1.225s] 事件: RACKET_HIT  半台: B       ID: racket_hit_00002
+  [帧 0179 |  1.492s] 事件: BOUNCE      半台: A       ID: bounce_00002
   ...
 ========================================================================
-处理完成！总帧数: 600 帧 | 耗时: 0.054s (11149.0 FPS)
+处理完成！总帧数: 600 帧 | 耗时: 0.039s (15504.7 FPS)
 物理事件统计: {'RACKET_HIT': 9, 'BOUNCE': 6}
-最终比分: P1 (半台A) 0 : 1 P2 (半台B)
+最终比分: P1 (半台A) 0 : 0 P2 (半台B)
 ========================================================================
 ```
+
+> 该样例从回合中段开始（无发球序列），门控 1（发球准入）正确地**不给分**：
+> 早期版本曾在这里误判 `SERVE_FAULT` 送出 0:1。证据不足时默认不判分——
+> **宁可漏判，不可误判**。
 
 ### 3. 模式 B：端到端视频推理并渲染比分看板
 适用于本地有视频文件或摄像头输入，调用 YOLO 适配器推理并渲染转播视频：
@@ -131,7 +138,7 @@ python run_referee.py \
 ### 4. 运行完整自动化测试
 ```bash
 python -m unittest discover -s tests -p "test_*.py"
-# 预期输出：Ran 159 tests in 0.999s ... OK
+# 预期输出：Ran 181 tests ... OK
 ```
 
 ---

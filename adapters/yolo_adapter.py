@@ -71,6 +71,15 @@ class YOLOAdapter(BaseAdapter):
         仅给出裁剪框、没有完整标定时的简化用法，``(y_min, y_max, x_min, x_max)``。
         与 ``calibration`` 二选一；都给时以 ``calibration`` 为准。
         两者都不给则对整帧推理（不裁剪）。
+    floor_margin_px:
+        **感知降噪 P1-2（球台 ROI 掩码）**：球台近边以下的容许深度
+        （**基准分辨率像素**，运行时按实际分辨率等比缩放）。检出中心低于
+        ``近边 y + floor_margin_px`` 视为地板反光 / 球鞋误检，**物理丢弃**
+        ——不入观测、不入带外候选（Test4 报告 §四.1 第 2 项）。
+        依据：test_4 官方真值实测真球全程不低于近边以下 16px（504 帧中仅
+        5 帧触及），而地板反光误检全部位于该区域以下。
+        ``None``（默认）= 不启用。需要 ``calibration``（无球台几何就没有
+        "地板"可言，此时传入本参数将抛错）。
     imgsz:
         推理分辨率（Ultralytics 的 ``imgsz``）。960 是本项目实测的性价比拐点。
     conf_threshold:
@@ -103,6 +112,7 @@ class YOLOAdapter(BaseAdapter):
         *,
         calibration: Optional[TableCalibration] = None,
         roi_box: Optional[Sequence[int]] = None,
+        floor_margin_px: Optional[float] = None,
         imgsz: int = 960,
         conf_threshold: float = 0.18,
         iou_threshold: float = 0.45,
@@ -116,6 +126,20 @@ class YOLOAdapter(BaseAdapter):
         if not os.path.isfile(weights_path):
             raise FileNotFoundError(f"YOLO weights not found: {weights_path}")
         self.weights_path = os.path.abspath(weights_path)
+
+        if floor_margin_px is not None:
+            if calibration is None:
+                raise ValueError(
+                    "floor_margin_px 需要球台标定（calibration）才能定义"
+                    "'球台近边以下'；roi_box 模式没有球台几何，请改用 "
+                    "calibration 或关闭该掩码"
+                )
+            if floor_margin_px < 0:
+                raise ValueError(f"floor_margin_px must be >= 0, got {floor_margin_px}")
+        self._floor_margin_px = (
+            float(floor_margin_px) if floor_margin_px is not None else None
+        )
+        self.floor_rejected_count = 0
 
         self._calibration = calibration
         self._static_roi: Optional[ROIBox] = (
@@ -166,6 +190,8 @@ class YOLOAdapter(BaseAdapter):
                 "conf_threshold": self.conf_threshold,
                 "iou_threshold": self.iou_threshold,
                 "device": self.device,
+                "floor_margin_px": self._floor_margin_px,
+                "floor_rejected": self.floor_rejected_count,
                 "calibration": (
                     self._resolved_calibration.name
                     if self._resolved_calibration is not None
@@ -186,6 +212,7 @@ class YOLOAdapter(BaseAdapter):
         self._last_crop_size = None
         self._candidates_frame = None
         self._candidates = []
+        self.floor_rejected_count = 0
 
     def close(self) -> None:
         self._model = None
@@ -239,6 +266,8 @@ class YOLOAdapter(BaseAdapter):
         self.last_inference_ms = (time.perf_counter() - t0) * 1000.0
 
         detections = self._extract_detections(results, offset)
+        if self._floor_margin_px is not None:
+            detections = self._reject_below_table(detections, height)
         if not detections:
             # §7.3：漏检就是漏检，不填历史位置、不用 (0,0) 占位
             return self.missing_observation(frame_id, timestamp_s, image_size)
@@ -269,6 +298,32 @@ class YOLOAdapter(BaseAdapter):
         if self._candidates_frame != frame_id:
             return []
         return list(self._candidates)
+
+    def _reject_below_table(
+        self, detections: List[BallObservation], frame_height: int
+    ) -> List[BallObservation]:
+        """感知降噪 P1-2：丢弃球台近边以下的地面检出（Test4 报告 §四.1 第 2 项）。
+
+        地板反光 / 球鞋白边是无球帧虚假检出的主要来源，而**真实小球全程
+        不会低于球台近边以下 ``floor_margin_px``**（test_4 官方真值实测：
+        504 个真球帧中仅 5 帧触及近边以下 16px）。检出中心 y 超过
+        ``近边 y + margin`` 即物理丢弃——不入观测、不入带外候选。
+
+        margin 按 ``frame_height / 原标定 base_height`` 等比缩放，与
+        :meth:`TableCalibration.scaled_to` 的 y 向缩放一致，因此同一套参数
+        可跨分辨率复用。
+        """
+        calib = self._resolved_calibration
+        if calib is None or self._calibration is None:
+            return detections      # 构造时已禁止此组合，防御性返回
+        near_edge_y = max(p[1] for p in calib.table_polygon)
+        margin = self._floor_margin_px * (
+            frame_height / float(self._calibration.base_height)
+        )
+        limit = near_edge_y + margin
+        kept = [d for d in detections if d.center_px[1] <= limit]
+        self.floor_rejected_count += len(detections) - len(kept)
+        return kept
 
     def _extract_detections(
         self, results: Any, offset: Tuple[int, int]

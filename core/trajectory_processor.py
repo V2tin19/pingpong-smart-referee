@@ -174,6 +174,16 @@ class ProcessorParams:
     confirm_min_speed_px_s: float = 50.0
     confirm_max_speed_px_s: float = 8000.0
 
+    # ---- 关联速度硬截断（感知降噪 P1-3：单帧位移硬截断）---------------------
+    # 已跟踪目标与新观测的**隐含速度**上界（px/s）。真实小球在画面上的速度有
+    # 物理上界（test_4 官方真值实测最大 7023 px/s；test_2 实测 5106 px/s），
+    # 超过它的"位移"不是球在飞，而是**检测瞬移**（漏检后地板反光/球鞋顶替
+    # 真球的典型形态，Test4 报告问题一）。命中即断轨重捕，绝不把瞬移喂进
+    # 卡尔曼——速度反转假象正是虚假 RACKET_HIT 的源头。
+    # 取 9000 = 实测最大值的 1.28 倍余量；25fps 下隐含速度天然低于此值，
+    # 守卫只在 120fps 这类高帧率下生效。0 = 关闭（消融用）。
+    max_assoc_speed_px_s: float = 9000.0
+
     # ---- 防尖刺与分段断连 -----------------------------------------------
     spike_dev_px: float = 28.0
     spike_span_px: float = 90.0
@@ -231,6 +241,7 @@ class ProcessorParams:
             # 像素速度类（px/s）
             "confirm_min_speed_px_s",
             "confirm_max_speed_px_s",
+            "max_assoc_speed_px_s",
             "bounce_vy_down",
             "bounce_vy_up",
             "hit_vx_min",
@@ -370,6 +381,7 @@ class TrajectoryEventProcessor:
             "predicted": 0,
             "smoothed": 0,
             "rejected_static": 0,
+            "rejected_assoc_jumps": 0,
             "tentative_started": 0,
             "confirmed_tracks": 0,
             "events": {t.value: 0 for t in EventType},
@@ -511,6 +523,22 @@ class TrajectoryEventProcessor:
             self._break_track()
             return None
 
+        # ---- 关联速度硬截断（感知降噪 P1-3）----
+        # 新观测相对上一个真实观测点的隐含速度超过物理上界 → 判为检测瞬移：
+        # 断轨重捕，绝不污染卡尔曼速度（防虚假 RACKET_HIT，Test4 报告问题一）。
+        # 上界依据官方真值实测：真球最大 7023 px/s（test_4 @120fps），
+        # 取 9000 = 1.28 倍余量。注意必须用"距上一真实观测点"的时间差，
+        # 而不是帧间隔——外推窗口内（≤ track_reset_s）真球位移很大也合法。
+        if params.max_assoc_speed_px_s > 0 and self._last_measured is not None:
+            lm = self._last_measured
+            elapsed = t - lm.timestamp_s
+            if elapsed > 1e-6:
+                implied_speed = math.hypot(pos[0] - lm.x, pos[1] - lm.y) / elapsed
+                if implied_speed > params.max_assoc_speed_px_s:
+                    self.stats["rejected_assoc_jumps"] += 1
+                    self._break_track()
+                    return None
+
         smoothed = self._kalman.correct(pos[0], pos[1])
         self._consecutive_measured += 1
         self._lost_since = None
@@ -561,6 +589,13 @@ class TrajectoryEventProcessor:
         vx = (pos[0] - tn.x) / max(gap, 1e-6)
         vy = (pos[1] - tn.y) / max(gap, 1e-6)
         self._kalman.initialize(pos[0], pos[1], vx, vy)
+        # 关键修复：确认帧的 predict() 发生在初始化**之前**，_last_prediction
+        # 仍为 None——下一帧的候选选择会误入"未跟踪"分支（距离盲选、只看
+        # 置信度），远处高置信误检（台面热点）将**劫持刚建立的跟踪**。
+        # 实测（test_4 帧 4560）：热点 conf 0.38 劫持真球延续 conf 0.32，
+        # 一步瞬移 590px/帧 —— 这正是 Test4 报告"问题一"瞬移的真正入口。
+        # 把预测参考钉在确认位置，下一帧选择即恢复距离门控。
+        self._last_prediction = (pos[0], pos[1])
         self._consecutive_measured = 2
         self._lost_since = None
         self._static_since = None
