@@ -26,6 +26,8 @@ data/*.mp4
 data/*.avi
 data/*.zip
 data/roboflow_ball_v7/
+data/game1_dataset/
+data/*_dataset/
 output/
 *.mp4
 *.avi

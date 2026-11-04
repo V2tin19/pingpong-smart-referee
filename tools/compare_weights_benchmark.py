@@ -180,7 +180,11 @@ def main():
     parser.add_argument("--max_frames", type=int, default=6002)
     parser.add_argument("--conf", type=float, default=0.18)
     parser.add_argument("--imgsz", type=int, default=960)
+    parser.add_argument("--preset", default=None, help="Preset name (default: auto guess)")
     args = parser.parse_args()
+
+    from core.geometry import guess_preset_name
+    preset_name = args.preset or guess_preset_name(args.video)
 
     print(f"Loading Ground Truth from {args.zip} (up to {args.max_frames} frames)...")
     gt = load_ground_truth(args.zip, max_frame=args.max_frames)
@@ -191,22 +195,22 @@ def main():
     print(f"Path: {args.weight_a}")
     print("=" * 70)
     res_a = evaluate_model(
-        args.weight_a, args.video, gt, preset_name="test4",
+        args.weight_a, args.video, gt, preset_name=preset_name,
         imgsz=args.imgsz, conf_thresh=args.conf, max_frames=args.max_frames
     )
 
     print("\n" + "=" * 70)
-    print("Evaluating Model B: 用户指定 ball_detector/best.pt")
+    print("Evaluating Model B: 新训练 yolo11n_game1_v1")
     print(f"Path: {args.weight_b}")
     print("=" * 70)
     res_b = evaluate_model(
-        args.weight_b, args.video, gt, preset_name="test4",
+        args.weight_b, args.video, gt, preset_name=preset_name,
         imgsz=args.imgsz, conf_thresh=args.conf, max_frames=args.max_frames
     )
 
     # 打印对比结果
     print("\n\n" + "#" * 78)
-    print(f"{'对比维度':<26} | {'Model A (clean_best)':<22} | {'Model B (detector_best)':<22}")
+    print(f"{'对比维度':<26} | {'Model A (clean_best)':<22} | {'Model B (game1_v1)':<22}")
     print("-" * 78)
     print(f"{'评估总帧数':<26} | {res_a['frames_evaluated']:<22} | {res_b['frames_evaluated']:<22}")
     print(f"{'真值球帧数 (GT)':<26} | {res_a['total_gt']:<22} | {res_b['total_gt']:<22}")

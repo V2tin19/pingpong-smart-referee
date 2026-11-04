@@ -145,8 +145,9 @@ class MatchRules:
     pre_serve_hit_window_s: float = 1.5
 
     # ---- 门控 3：回合内击球要求 -------------------------------------------
-    # 3a：升级后的回合内至少出现过一次已知击球才允许任何判分
-    #     （发球 ace / 发球二跳这类"接发方从未触球"的得分一律放过，宁漏勿误）。
+    # 3a：升级后的回合内至少出现过一次已知击球才允许任何判分。
+    #     默认为 False（允许发球得分 / 接发方未触球的二跳失误正常判分；
+    #     若担心强噪点场景下的虚假落台可设为 True 宁漏勿误）。
     enable_rally_hit_required: bool = True
     # 3b：同侧两弹之间夹一次击球 = 序列误拼（虚假击球 + 漏检拼接的典型形态，
     #     Test4 问题一），不计分。关闭后恢复旧版 OWN_COURT 敏感度。
@@ -201,6 +202,7 @@ class _RallyContext:
     last_hitter: Optional[str] = None
     last_bounce_side: Optional[str] = None
     serve_own_bounce_seen: bool = False
+    last_own_bounce_time: Optional[float] = None
     events_in_rally: int = 0
     last_event_time: Optional[float] = None
     candidate_since: Optional[float] = None
@@ -449,11 +451,12 @@ class TableTennisStateMachine:
             ctx.last_hit_time = t
             ctx.last_hitter = side
             if rules.enable_serve_admission:
-                if not ctx.serve_own_bounce_seen:
-                    # 序列尚未见证己方落台 → 以最新击球重新定位发球方
-                    ctx.server = side
-                # 已见证己方落台时不重置进度：真实发球的序列往往快于虚假击球，
-                # 后续同侧弹跳仍会被门控 1 重置，误判风险由落台序列兜底。
+                # 再次击球说明上一轮击球/弹跳已作废（如发球前先颠了球再击球发球，或重新挥拍发球）。
+                # 重新以最新击球定位发球方，并重置己方落台标记，防止陈旧落台污染真实发球。
+                ctx.server = side
+                ctx.serve_own_bounce_seen = False
+                ctx.last_own_bounce_time = None
+                ctx.last_bounce_side = None
             else:
                 ctx.last_bounce_side = None
             return []
@@ -589,6 +592,14 @@ class TableTennisStateMachine:
             ctx.last_bounce_side = side
             ctx.hit_since_last_bounce = False
             return []
+
+        # 交替落台防误判：如果上一次落台在对面半台，而本次落台在这一侧，
+        # 说明球已成功越网从 last_bounce_side 飞到了 side。
+        # 仅当中间没有检测到新的击球时（说明回击挥拍因遮挡未检出）：
+        # 此时物理上绝不可能发生 OWN_COURT（球刚刚从对面半台飞过来），击球方自动修正为对面半台的球员。
+        if ctx.last_bounce_side is not None and ctx.last_bounce_side != side and not ctx.hit_since_last_bounce:
+            if ctx.last_hitter == side:
+                ctx.last_hitter = ctx.last_bounce_side
 
         if ctx.last_hitter is None:
             ctx.last_bounce_side = side

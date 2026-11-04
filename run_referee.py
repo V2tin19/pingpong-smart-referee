@@ -47,6 +47,8 @@ def run_from_jsonl(
     video_path: Optional[str] = None,
     output_path: Optional[str] = None,
     rules: Optional[MatchRules] = None,
+    render_scale: float = 1.0,
+    render_fps: Optional[float] = None,
 ) -> int:
     if not os.path.isfile(jsonl_path):
         print(f"[错误] 找不到观测文件: {jsonl_path}")
@@ -69,11 +71,16 @@ def run_from_jsonl(
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         homography = TableHomography(calib, image_size=(w, h))
 
+    out_w = int(round(w * render_scale / 2.0)) * 2
+    out_h = int(round(h * render_scale / 2.0)) * 2
+    out_fps = render_fps or fps
+    frame_step = max(1, int(round(fps / out_fps)))
+
     if output_path and cap:
         out_dir = os.path.dirname(os.path.abspath(output_path))
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
-        writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (out_w, out_h))
         hud = BroadcastHUD(calib, homography)
 
     counts = Counter()
@@ -125,7 +132,7 @@ def run_from_jsonl(
             # 渲染视频 HUD
             if cap and writer:
                 ok, frame = cap.read()
-                if ok:
+                if ok and (obs.frame_id % frame_step == 0):
                     current = processor.trajectory[-1] if processor.trajectory else None
                     hud_state = HUDState(
                         frame_id=obs.frame_id,
@@ -142,7 +149,8 @@ def run_from_jsonl(
                         current_pos=(current.x, current.y) if current is not None else None,
                         track_method="tracknet",
                     )
-                    writer.write(hud.render(frame, hud_state))
+                    draw_frame = cv2.resize(frame, (out_w, out_h)) if (out_w != w or out_h != h) else frame
+                    writer.write(hud.render(draw_frame, hud_state))
 
     if cap:
         cap.release()
@@ -170,6 +178,8 @@ def run_from_video(
     max_frames: Optional[int] = None,
     rules: Optional[MatchRules] = None,
     floor_margin_px: Optional[float] = None,
+    render_scale: float = 1.0,
+    render_fps: Optional[float] = None,
 ) -> int:
     from adapters.yolo_adapter import YOLOAdapter
 
@@ -202,13 +212,18 @@ def run_from_video(
         strict_time=True,
     )
 
+    out_w = int(round(w * render_scale / 2.0)) * 2
+    out_h = int(round(h * render_scale / 2.0)) * 2
+    out_fps = render_fps or fps
+    frame_step = max(1, int(round(fps / out_fps)))
+
     writer = None
     hud = None
     if output_path:
         out_dir = os.path.dirname(os.path.abspath(output_path))
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
-        writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (out_w, out_h))
         hud = BroadcastHUD(calib, homography)
 
     jsonl_fp = None
@@ -229,6 +244,8 @@ def run_from_video(
     print(f"视频文件: {os.path.basename(video_path)} ({w}x{h} @ {fps:.1f}fps, {n_frames} 帧)")
     print(f"机位预设: {preset_name} (球网X像素: {calib.net_x})")
     print(f"模型权重: {os.path.basename(weights_path)}")
+    if output_path:
+        print(f"渲染配置: {out_w}x{out_h} @ {out_fps:.1f}fps (抽帧步长: {frame_step}, 比例: {render_scale:.2f})")
     print("=" * 72)
 
     for frame_id in range(n_frames):
@@ -259,8 +276,8 @@ def run_from_video(
                 last_decision_text, last_decision_t = decision.describe(), t
                 print(f"  [帧 {frame_id:04d} | {t:6.3f}s] >> 判罚: {decision.describe()}")
 
-        # HUD 渲染
-        if writer and hud:
+        # HUD 渲染 (仅在采样输出帧时执行)
+        if writer and hud and (frame_id % frame_step == 0):
             current = processor.trajectory[-1] if processor.trajectory else None
             hud_state = HUDState(
                 frame_id=frame_id,
@@ -277,7 +294,8 @@ def run_from_video(
                 current_pos=(current.x, current.y) if current is not None else None,
                 track_method="yolo",
             )
-            writer.write(hud.render(frame, hud_state))
+            draw_frame = cv2.resize(frame, (out_w, out_h)) if (out_w != w or out_h != h) else frame
+            writer.write(hud.render(draw_frame, hud_state))
 
     cap.release()
     if writer:
@@ -309,6 +327,12 @@ def main():
     parser.add_argument("--conf", type=float, default=0.18, help="YOLO 检测阈值 (默认: 0.18)")
     parser.add_argument("--reject-floor", type=float, default=None, metavar="PX",
                         help="感知降噪：丢弃球台近边以下 PX 像素的地面检出 (Test4 建议 30；默认关)")
+    parser.add_argument("--strict-rally-hit", action="store_true", default=False,
+                        help="开启门控 3a 强限制（回合内无击球时忽略接发二跳判分；默认关闭以允许合法发球得分/接发失误判分）")
+    parser.add_argument("--render-scale", type=float, default=1.0,
+                        help="渲染输出视频分辨率缩放比例 (如 0.667 为 720p, 0.5 为 540p，可大幅加速编码)")
+    parser.add_argument("--render-fps", type=float, default=None,
+                        help="渲染输出视频帧率 (如 60.0 可减半编码工作量，保持流畅转播)")
 
     args = parser.parse_args()
 
@@ -322,12 +346,17 @@ def main():
         ref_name = args.jsonl or args.video or "test2"
         preset_name = guess_preset_name(ref_name)
 
+    rules = MatchRules(enable_rally_hit_required=args.strict_rally_hit)
+
     if args.jsonl:
         return run_from_jsonl(
             jsonl_path=args.jsonl,
             preset_name=preset_name,
             video_path=args.video,
             output_path=args.output,
+            rules=rules,
+            render_scale=args.render_scale,
+            render_fps=args.render_fps,
         )
     else:
         return run_from_video(
@@ -339,7 +368,10 @@ def main():
             output_path=args.output,
             export_jsonl=args.export_jsonl,
             max_frames=args.max_frames,
+            rules=rules,
             floor_margin_px=args.reject_floor,
+            render_scale=args.render_scale,
+            render_fps=args.render_fps,
         )
 
 

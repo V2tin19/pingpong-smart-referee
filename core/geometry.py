@@ -315,6 +315,7 @@ CALIBRATION_PRESETS: Dict[str, TableCalibration] = {
 #   * 同一视频时刻整帧平均绝对差仅 7/255，下半幅（球台/地面）6.7/255。
 # 帧率差异不影响标定（标定只与机位有关）；时间戳由视频实际帧率换算。
 CALIBRATION_PRESETS["test2"] = replace(CALIBRATION_PRESETS["game2"], name="test2")
+CALIBRATION_PRESETS["test3"] = replace(CALIBRATION_PRESETS["game2"], name="test3")
 
 
 def guess_preset_name(video_path: str) -> str:
@@ -331,9 +332,11 @@ def guess_preset_name(video_path: str) -> str:
         return "rally"
     if "plos" in lowered:
         return "plos"
-    # 顺序要紧：test_2 / test_4 必须先于默认分支；且 "test_game_2" 不含子串 "test_2"
+    # 顺序要紧：test_2 / test_3 / test_4 必须先于默认分支；且 "test_game_2" 不含子串 "test_2"
     if "test_4" in lowered or "test4" in lowered:
         return "test4"
+    if "test_3" in lowered or "test3" in lowered:
+        return "test3"
     if "test_2" in lowered or "test2" in lowered:
         return "test2"
     return "game2"

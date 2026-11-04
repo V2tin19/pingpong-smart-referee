@@ -106,6 +106,8 @@ class BroadcastHUD:
         if frame is None or not isinstance(frame, np.ndarray):
             raise TypeError("frame must be a numpy array (BGR image)")
         self._s = float(frame.shape[1]) / _REF_W
+        self._sx = float(frame.shape[1]) / float(self.calibration.base_width)
+        self._sy = float(frame.shape[0]) / float(self.calibration.base_height)
         self._draw_table(frame)
         self._draw_trajectory(frame, hud)
         self._draw_ball(frame, hud)
@@ -138,12 +140,16 @@ class BroadcastHUD:
     # 球台与球网
     # ------------------------------------------------------------------
     def _draw_table(self, img: np.ndarray) -> None:
-        poly = np.asarray(self.calibration.table_polygon, dtype=np.int32)
+        poly = np.asarray(
+            [(int(round(p[0] * self._sx)), int(round(p[1] * self._sy))) for p in self.calibration.table_polygon],
+            dtype=np.int32,
+        )
         cv2.polylines(img, [poly], True, (255, 220, 0), self._px(2), cv2.LINE_AA)
-        y0 = int(min(p[1] for p in self.calibration.table_polygon))
-        y1 = int(max(p[1] for p in self.calibration.table_polygon))
+        y0 = int(round(min(p[1] * self._sy for p in self.calibration.table_polygon)))
+        y1 = int(round(max(p[1] * self._sy for p in self.calibration.table_polygon)))
+        net_x = int(round(self.calibration.net_x * self._sx))
         cv2.line(
-            img, (self.calibration.net_x, y0), (self.calibration.net_x, y1),
+            img, (net_x, y0), (net_x, y1),
             (255, 0, 255), self._px(2), cv2.LINE_AA,
         )
 
@@ -178,7 +184,7 @@ class BroadcastHUD:
                     color, thick, alpha = _C_SMOOTHED, 2, 0.9
                 else:
                     color, thick, alpha = _C_MEASURED, 2, 1.0
-                self._line(img, (a.x, a.y), (b.x, b.y), color, thick, alpha)
+                self._line(img, (a.x * self._sx, a.y * self._sy), (b.x * self._sx, b.y * self._sy), color, thick, alpha)
 
     def _line(
         self,
@@ -205,7 +211,7 @@ class BroadcastHUD:
     def _draw_ball(self, img: np.ndarray, hud: HUDState) -> None:
         if hud.current_pos is None:
             return
-        x, y = int(round(hud.current_pos[0])), int(round(hud.current_pos[1]))
+        x, y = int(round(hud.current_pos[0] * self._sx)), int(round(hud.current_pos[1] * self._sy))
         color = {
             "yolo": _C_MEASURED,
             "patch": _C_SMOOTHED,
@@ -222,7 +228,7 @@ class BroadcastHUD:
     def _draw_landings(self, img: np.ndarray, hud: HUDState) -> None:
         for lp in hud.landings[-self.landing_history:]:
             color = _C_LANDING_IN if lp.in_table else _C_LANDING_OUT
-            cx, cy = int(round(lp.image_px[0])), int(round(lp.image_px[1]))
+            cx, cy = int(round(lp.image_px[0] * self._sx)), int(round(lp.image_px[1] * self._sy))
             cv2.circle(img, (cx, cy), self._px(12), color, self._px(2), cv2.LINE_AA)
             cv2.circle(img, (cx, cy), self._px(3), color, -1, cv2.LINE_AA)
 
