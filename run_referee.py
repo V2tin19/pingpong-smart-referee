@@ -33,6 +33,7 @@ import cv2
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
+from core.evidence_adjudicator import EvidenceStateMachine, RallyDecision
 from core.geometry import guess_preset_name, preset
 from core.homography import TableHomography
 from core.schemas import EventType, FrameObservation
@@ -47,6 +48,7 @@ def run_from_jsonl(
     video_path: Optional[str] = None,
     output_path: Optional[str] = None,
     rules: Optional[MatchRules] = None,
+    adjudicator: str = "shadow",
     render_scale: float = 1.0,
     render_fps: Optional[float] = None,
 ) -> int:
@@ -57,6 +59,7 @@ def run_from_jsonl(
     calib = preset(preset_name)
     homography = TableHomography(calib, image_size=(1920, 1080))
     state_machine = TableTennisStateMachine(rules or MatchRules())
+    evidence_sm = EvidenceStateMachine(calib) if adjudicator in ("shadow", "evidence") else None
 
     cap = None
     writer = None
@@ -113,35 +116,65 @@ def run_from_jsonl(
             t = obs.timestamp_s
 
             # 状态机时钟推进（处理超时等）
-            for decision in state_machine.tick(t):
-                last_decision_text, last_decision_t = decision.describe(), t
-                print(f"  [帧 {obs.frame_id:04d} | {t:6.3f}s] >> 判罚: {decision.describe()}")
+            if adjudicator in ("legacy", "shadow"):
+                for decision in state_machine.tick(t):
+                    last_decision_text, last_decision_t = decision.describe(), t
+                    prefix = ">> [传统状态机] " if adjudicator == "shadow" else ">> 判罚: "
+                    print(f"  [帧 {obs.frame_id:04d} | {t:6.3f}s] {prefix}{decision.describe()}")
+
+            if evidence_sm is not None:
+                for ev_decision in evidence_sm.tick(t):
+                    if adjudicator == "evidence":
+                        last_decision_text, last_decision_t = ev_decision.describe(), t
+                    print(f"  [帧 {obs.frame_id:04d} | {t:6.3f}s] >> [回合证据引擎] {ev_decision.describe()}")
 
             # 物理事件提取
             for ev in processor.update(obs):
                 counts[ev.type] += 1
                 if ev.type == EventType.BOUNCE.value:
                     landings.append(homography.locate_landing_from_event(ev))
-                print(f"  [帧 {obs.frame_id:04d} | {t:6.3f}s] 事件: {ev.type:<11} 半台: {ev.side:<7} ID: {ev.event_id}")
+                conf_str = f" conf={ev.confidence:.2f}" if ev.confidence is not None else ""
+                edge_str = f" d_edge={ev.distance_to_edge_cm:.1f}cm" if ev.distance_to_edge_cm is not None else ""
+                print(f"  [帧 {obs.frame_id:04d} | {t:6.3f}s] 事件: {ev.type:<11} 半台: {ev.side:<7}{conf_str}{edge_str} ID: {ev.event_id}")
 
-                # 驱动状态机
-                for decision in state_machine.update(ev):
-                    last_decision_text, last_decision_t = decision.describe(), t
-                    print(f"  [帧 {obs.frame_id:04d} | {t:6.3f}s] >> 判罚: {decision.describe()}")
+                # 驱动传统状态机
+                if adjudicator in ("legacy", "shadow"):
+                    for decision in state_machine.update(ev):
+                        last_decision_text, last_decision_t = decision.describe(), t
+                        prefix = ">> [传统状态机] " if adjudicator == "shadow" else ">> 判罚: "
+                        print(f"  [帧 {obs.frame_id:04d} | {t:6.3f}s] {prefix}{decision.describe()}")
+
+                # 驱动回合级证据引擎
+                if evidence_sm is not None:
+                    for ev_decision in evidence_sm.update(ev):
+                        if adjudicator == "evidence":
+                            last_decision_text, last_decision_t = ev_decision.describe(), t
+                        print(f"  [帧 {obs.frame_id:04d} | {t:6.3f}s] >> [回合证据引擎] {ev_decision.describe()}")
 
             # 渲染视频 HUD
             if cap and writer:
                 ok, frame = cap.read()
                 if ok and (obs.frame_id % frame_step == 0):
                     current = processor.trajectory[-1] if processor.trajectory else None
+                    if adjudicator == "evidence" and evidence_sm is not None:
+                        hud_score = (evidence_sm.points["A"], evidence_sm.points["B"])
+                        hud_state_name = evidence_sm.phase.value
+                        hud_server = evidence_sm.server
+                        hud_over = evidence_sm.game_over
+                    else:
+                        hud_score = (state_machine.points["A"], state_machine.points["B"])
+                        hud_state_name = state_machine.state.value
+                        hud_server = state_machine.server
+                        hud_over = state_machine.game_over
+
                     hud_state = HUDState(
                         frame_id=obs.frame_id,
                         timestamp_s=t,
                         fps=fps,
-                        score=(state_machine.points["A"], state_machine.points["B"]),
-                        state=state_machine.state.value,
-                        server=state_machine.server,
-                        game_over=state_machine.game_over,
+                        score=hud_score,
+                        state=hud_state_name,
+                        server=hud_server,
+                        game_over=hud_over,
                         last_decision=last_decision_text,
                         decision_age_s=t - last_decision_t,
                         track_points=processor.trajectory,
@@ -162,7 +195,10 @@ def run_from_jsonl(
     print("\n" + "=" * 72)
     print(f"处理完成！总帧数: {obs_total} 帧 | 耗时: {elapsed:.3f}s ({obs_total/max(elapsed, 1e-4):.1f} FPS)")
     print(f"物理事件统计: {dict(counts)}")
-    print(f"最终比分: P1 (半台A) {state_machine.points['A']} : {state_machine.points['B']} P2 (半台B)")
+    if adjudicator in ("legacy", "shadow"):
+        print(f"【传统状态机比分】: P1 (半台A) {state_machine.points['A']} : {state_machine.points['B']} P2 (半台B)")
+    if evidence_sm is not None:
+        print(f"【回合证据引擎比分】: P1 (半台A) {evidence_sm.points['A']} : {evidence_sm.points['B']} P2 (半台B) (已裁决 {len(evidence_sm._decisions_history)} 回合)")
     print("=" * 72)
     return 0
 
@@ -177,6 +213,7 @@ def run_from_video(
     export_jsonl: Optional[str] = None,
     max_frames: Optional[int] = None,
     rules: Optional[MatchRules] = None,
+    adjudicator: str = "shadow",
     floor_margin_px: Optional[float] = None,
     render_scale: float = 1.0,
     render_fps: Optional[float] = None,
@@ -192,6 +229,7 @@ def run_from_video(
 
     calib = preset(preset_name)
     state_machine = TableTennisStateMachine(rules or MatchRules())
+    evidence_sm = EvidenceStateMachine(calib) if adjudicator in ("shadow", "evidence") else None
     processor = TrajectoryEventProcessor(calib, source="yolo")
 
     cap = cv2.VideoCapture(video_path)
@@ -261,32 +299,63 @@ def run_from_video(
         cands = adapter.candidates_for(frame_id)
 
         # 状态机心跳
-        for decision in state_machine.tick(t):
-            last_decision_text, last_decision_t = decision.describe(), t
-            print(f"  [帧 {frame_id:04d} | {t:6.3f}s] >> 判罚: {decision.describe()}")
+        if adjudicator in ("legacy", "shadow"):
+            for decision in state_machine.tick(t):
+                last_decision_text, last_decision_t = decision.describe(), t
+                prefix = ">> [传统状态机] " if adjudicator == "shadow" else ">> 判罚: "
+                print(f"  [帧 {frame_id:04d} | {t:6.3f}s] {prefix}{decision.describe()}")
+
+        if evidence_sm is not None:
+            for ev_decision in evidence_sm.tick(t):
+                if adjudicator == "evidence":
+                    last_decision_text, last_decision_t = ev_decision.describe(), t
+                print(f"  [帧 {frame_id:04d} | {t:6.3f}s] >> [回合证据引擎] {ev_decision.describe()}")
 
         # 轨迹事件提取与状态转移
         for ev in processor.update(obs, candidates=cands):
             counts[ev.type] += 1
             if ev.type == EventType.BOUNCE.value:
                 landings.append(homography.locate_landing_from_event(ev))
-            print(f"  [帧 {frame_id:04d} | {t:6.3f}s] 事件: {ev.type:<11} 半台: {ev.side:<7} ID: {ev.event_id}")
+            conf_str = f" conf={ev.confidence:.2f}" if ev.confidence is not None else ""
+            edge_str = f" d_edge={ev.distance_to_edge_cm:.1f}cm" if ev.distance_to_edge_cm is not None else ""
+            print(f"  [帧 {frame_id:04d} | {t:6.3f}s] 事件: {ev.type:<11} 半台: {ev.side:<7}{conf_str}{edge_str} ID: {ev.event_id}")
 
-            for decision in state_machine.update(ev):
-                last_decision_text, last_decision_t = decision.describe(), t
-                print(f"  [帧 {frame_id:04d} | {t:6.3f}s] >> 判罚: {decision.describe()}")
+            # 驱动传统状态机
+            if adjudicator in ("legacy", "shadow"):
+                for decision in state_machine.update(ev):
+                    last_decision_text, last_decision_t = decision.describe(), t
+                    prefix = ">> [传统状态机] " if adjudicator == "shadow" else ">> 判罚: "
+                    print(f"  [帧 {frame_id:04d} | {t:6.3f}s] {prefix}{decision.describe()}")
+
+            # 驱动回合级证据引擎
+            if evidence_sm is not None:
+                for ev_decision in evidence_sm.update(ev):
+                    if adjudicator == "evidence":
+                        last_decision_text, last_decision_t = ev_decision.describe(), t
+                    print(f"  [帧 {frame_id:04d} | {t:6.3f}s] >> [回合证据引擎] {ev_decision.describe()}")
 
         # HUD 渲染 (仅在采样输出帧时执行)
         if writer and hud and (frame_id % frame_step == 0):
             current = processor.trajectory[-1] if processor.trajectory else None
+            if adjudicator == "evidence" and evidence_sm is not None:
+                hud_score = (evidence_sm.points["A"], evidence_sm.points["B"])
+                hud_state_name = evidence_sm.phase.value
+                hud_server = evidence_sm.server
+                hud_over = evidence_sm.game_over
+            else:
+                hud_score = (state_machine.points["A"], state_machine.points["B"])
+                hud_state_name = state_machine.state.value
+                hud_server = state_machine.server
+                hud_over = state_machine.game_over
+
             hud_state = HUDState(
                 frame_id=frame_id,
                 timestamp_s=t,
                 fps=fps,
-                score=(state_machine.points["A"], state_machine.points["B"]),
-                state=state_machine.state.value,
-                server=state_machine.server,
-                game_over=state_machine.game_over,
+                score=hud_score,
+                state=hud_state_name,
+                server=hud_server,
+                game_over=hud_over,
                 last_decision=last_decision_text,
                 decision_age_s=t - last_decision_t,
                 track_points=processor.trajectory,
@@ -309,7 +378,10 @@ def run_from_video(
     print("\n" + "=" * 72)
     print(f"处理完成！处理帧数: {n_frames} | 耗时: {elapsed:.2f}s ({n_frames/max(elapsed, 1e-4):.1f} FPS)")
     print(f"物理事件统计: {dict(counts)}")
-    print(f"最终比分: P1 (半台A) {state_machine.points['A']} : {state_machine.points['B']} P2 (半台B)")
+    if adjudicator in ("legacy", "shadow"):
+        print(f"【传统状态机比分】: P1 (半台A) {state_machine.points['A']} : {state_machine.points['B']} P2 (半台B)")
+    if evidence_sm is not None:
+        print(f"【回合证据引擎比分】: P1 (半台A) {evidence_sm.points['A']} : {evidence_sm.points['B']} P2 (半台B) (已裁决 {len(evidence_sm._decisions_history)} 回合)")
     print("=" * 72)
     return 0
 
@@ -320,6 +392,8 @@ def main():
     parser.add_argument("--video", default=None, help="输入视频或摄像头设备路径")
     parser.add_argument("--weights", default="weights/yolo11n_clean_best.pt", help="YOLO 权重路径 (视频模式必填)")
     parser.add_argument("--preset", default=None, help="球台机位预设 (test2, game2, rally, plos)")
+    parser.add_argument("--adjudicator", choices=["legacy", "evidence", "shadow"], default="shadow",
+                        help="裁判判分引擎模式：'legacy'(传统即时状态机), 'evidence'(回合级证据假设引擎), 'shadow'(影子双跑对照, 默认)")
     parser.add_argument("--output", default=None, help="[可选] 渲染带 HUD 比分板的视频保存路径")
     parser.add_argument("--export-jsonl", default=None, help="[可选] 将推理观测导出为 JSONL 文件")
     parser.add_argument("--max-frames", type=int, default=None, help="最大处理帧数限制")
@@ -355,6 +429,7 @@ def main():
             video_path=args.video,
             output_path=args.output,
             rules=rules,
+            adjudicator=args.adjudicator,
             render_scale=args.render_scale,
             render_fps=args.render_fps,
         )
@@ -369,6 +444,7 @@ def main():
             export_jsonl=args.export_jsonl,
             max_frames=args.max_frames,
             rules=rules,
+            adjudicator=args.adjudicator,
             floor_margin_px=args.reject_floor,
             render_scale=args.render_scale,
             render_fps=args.render_fps,

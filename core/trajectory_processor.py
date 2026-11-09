@@ -720,48 +720,78 @@ class TrajectoryEventProcessor:
             and (abs(vx_prev) > params.hit_vx_min or abs(vx_curr) > params.hit_vx_min)
         ):
             # 击球方归属：**用球被击出后的飞行方向推断，而不是用检出位置**。
-            #
-            # 物理依据：球员一定把球打向对方半台。所以球往右飞(vx>0) → 击球方在左(A)；
-            # 球往左飞(vx<0) → 击球方在右(B)。
-            #
-            # 为什么不能用位置：速度反转是在**实际击球之后几帧**才被卡尔曼检出的，
-            # 而球很快（120fps 下约 10px/帧），检出时球已越过球网，`side_of(x)` 会
-            # 把击球方判成对面那一侧，进而让状态机把正常对打误判成 OWN_COURT。
             hit_side = "A" if vx_curr > 0 else "B"
+            v_prev_mag = math.hypot(vx_prev, vy_prev)
+            dv_mag = math.hypot(vx_curr - vx_prev, vy_curr - vy_prev)
+            dv_ratio = dv_mag / max(v_prev_mag, 1.0)
+            recent_traj = list(self._trajectory)[-10:]
+            gap_cnt = sum(1 for p in recent_traj if not p.is_observed)
+            det_conf = point.confidence or 0.8
+
+            # 击球物理置信度计算: c_hit = det_conf * min(1, dv_ratio / r_ref) * (1 - lambda * gap)
+            r_ref = 0.5
+            dv_term = min(1.0, dv_ratio / r_ref)
+            gap_ratio = min(1.0, gap_cnt / 10.0)
+            gap_term = max(0.2, 1.0 - 0.5 * gap_ratio)
+            c_hit = max(0.05, min(1.0, det_conf * dv_term * gap_term))
+
             ev = self._emit(
-                EventType.RACKET_HIT, t, point, calib, params, point.confidence, side=hit_side
+                EventType.RACKET_HIT, t, point, calib, params, c_hit, side=hit_side,
+                dv_ratio=dv_ratio, gap_frames=gap_cnt, det_conf=det_conf,
             )
             if ev:
                 events.append(ev)
 
         if self._is_bounce(vx_prev, vy_prev, vx_curr, vy_curr, params):
             # 落点拐点 + 落点位置 → 区分"落台"与"落在台外"。
-            # 判定在**物理厘米空间**做（不是像素）：像素阈值在透视下各向异性，
-            # 同一阈值在长边/短边方向代表的物理距离能差近一个数量级。
             landing = homography.locate_landing(point.position)
-            if landing.distance_to_edge_cm >= -params.out_margin_cm:
-                # 落台侧归属用**球台物理坐标**（x_cm 与 137cm 球网线比较），
-                # 不用像素域的 ``calib.side_of()``：透视下图像上的一条竖直线
-                # 并不对应球台平面上恒定的物理 x，近网落点按像素判会归错侧
-                # （与 R-017"击球方按飞行方向归属"是同一类修正）。
-                # 此处投影是合法的：落点拐点意味着球就在台面平面上（§5）。
+            d_edge = landing.distance_to_edge_cm
+            v_prev_mag = math.hypot(vx_prev, vy_prev)
+            dv_mag = math.hypot(vx_curr - vx_prev, vy_curr - vy_prev)
+            dv_ratio = dv_mag / max(v_prev_mag, 1.0)
+            recent_traj = list(self._trajectory)[-10:]
+            gap_cnt = sum(1 for p in recent_traj if not p.is_observed)
+            det_conf = point.confidence or 0.8
+
+            # 落台 vs 出界判定：在物理厘米空间进行
+            # - 距离台边 >= -params.out_margin_cm（含台内与擦边容差区）：报 BOUNCE 并携带真实的带符号 d_edge
+            # - 距离台边 < -params.out_margin_cm 且在良态近台外区：报 OUT 作为保底，同样携带 d_edge
+            if d_edge >= -params.out_margin_cm:
+                tau_e = 5.0
+                # 边界距离 sigmoid：内深为 ~1.0，压边为 0.5，轻微台外为 0.1~0.4
+                sigma_edge = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, d_edge / tau_e))))
+                dv_term = min(1.0, dv_ratio / 0.4)
+                gap_ratio = min(1.0, gap_cnt / 10.0)
+                gap_term = max(0.2, 1.0 - 0.5 * gap_ratio)
+                c_bounce = max(0.05, min(1.0, det_conf * sigma_edge * dv_term * gap_term))
+
                 ev = self._emit(
-                    EventType.BOUNCE, t, point, calib, params, point.confidence,
+                    EventType.BOUNCE, t, point, calib, params, c_bounce,
                     side=homography.side_of_cm(landing.x_cm),
+                    distance_to_edge_cm=d_edge,
+                    dv_ratio=dv_ratio,
+                    gap_frames=gap_cnt,
+                    det_conf=det_conf,
                 )
             elif self._in_out_region(point, calib, params):
-                # 球在台外发生了方向反转 = 落在台外
+                # 球在台外发生了方向反转 = 落在台外（保底 OUT）
                 ev = self._emit(
-                    EventType.OUT, t, point, calib, params, (point.confidence or 0.0) * 0.5
+                    EventType.OUT, t, point, calib, params, (det_conf * 0.5),
+                    distance_to_edge_cm=d_edge,
+                    dv_ratio=dv_ratio,
+                    gap_frames=gap_cnt,
+                    det_conf=det_conf,
                 )
             else:
-                # 台外拐点但位于病态区域（远端压缩区）→ 不报，交给状态机超时判据
                 ev = None
             if ev:
                 events.append(ev)
 
         if self._is_net_touch(point, calib, params, vx_prev, vx_curr):
-            ev = self._emit(EventType.NET_TOUCH, t, point, calib, params, point.confidence)
+            ev = self._emit(
+                EventType.NET_TOUCH, t, point, calib, params, point.confidence,
+                det_conf=point.confidence,
+            )
             if ev:
                 events.append(ev)
 
@@ -847,6 +877,10 @@ class TrajectoryEventProcessor:
         params: ProcessorParams,
         confidence: Optional[float],
         side: Optional[str] = None,
+        distance_to_edge_cm: Optional[float] = None,
+        dv_ratio: Optional[float] = None,
+        gap_frames: int = 0,
+        det_conf: Optional[float] = None,
     ) -> Optional[RefereeEvent]:
         """生成事件。
 
@@ -879,6 +913,10 @@ class TrajectoryEventProcessor:
             position_px=(point.x, point.y),
             confidence=confidence,
             sources=[self._source],
+            distance_to_edge_cm=distance_to_edge_cm,
+            dv_ratio=dv_ratio,
+            gap_frames=gap_frames,
+            det_conf=det_conf,
         )
         self._last_event_time[key] = t
         self._recent_events.append(event)

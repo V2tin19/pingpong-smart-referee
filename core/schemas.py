@@ -457,6 +457,11 @@ class RefereeEvent:
     position_px: Optional[Tuple[float, float]] = None
     confidence: Optional[float] = None
     sources: List[str] = field(default_factory=list)
+    # ---- 阶段 1 新增物理置信度与几何度量字段 --------------------------------
+    distance_to_edge_cm: Optional[float] = None   # 落点到台面的带符号距离(cm)，内正外负
+    dv_ratio: Optional[float] = None              # 事件前后速度突变幅度 / 事件前速度
+    gap_frames: int = 0                           # 事件前后窗口内小球漏检帧数
+    det_conf: Optional[float] = None              # 视觉检测框置信度 (YOLO conf)
 
     def __post_init__(self) -> None:
         if not isinstance(self.event_id, str) or not self.event_id.strip():
@@ -479,8 +484,17 @@ class RefereeEvent:
             raise TypeError("sources must be a list of source names, not a bare string")
         self.sources = [_as_source(s) for s in self.sources]
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
+        if self.distance_to_edge_cm is not None:
+            self.distance_to_edge_cm = float(self.distance_to_edge_cm)
+        if self.dv_ratio is not None:
+            self.dv_ratio = float(self.dv_ratio)
+        if self.gap_frames is not None:
+            self.gap_frames = int(self.gap_frames)
+        if self.det_conf is not None:
+            self.det_conf = _as_confidence(self.det_conf, "det_conf")
+
+    def to_dict(self, include_metrics: bool = False) -> Dict[str, Any]:
+        data: Dict[str, Any] = {
             "event_id": self.event_id,
             "timestamp_s": self.timestamp_s,
             "type": self.type,
@@ -489,6 +503,14 @@ class RefereeEvent:
             "confidence": self.confidence,
             "sources": list(self.sources),
         }
+        if include_metrics:
+            data.update({
+                "distance_to_edge_cm": self.distance_to_edge_cm,
+                "dv_ratio": self.dv_ratio,
+                "gap_frames": self.gap_frames,
+                "det_conf": self.det_conf,
+            })
+        return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RefereeEvent":
@@ -500,6 +522,10 @@ class RefereeEvent:
             position_px=data.get("position_px"),
             confidence=data.get("confidence"),
             sources=list(data.get("sources") or []),
+            distance_to_edge_cm=data.get("distance_to_edge_cm"),
+            dv_ratio=data.get("dv_ratio"),
+            gap_frames=int(data.get("gap_frames", 0)),
+            det_conf=data.get("det_conf"),
         )
 
     def to_json(self, indent: Optional[int] = None) -> str:
