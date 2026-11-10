@@ -21,7 +21,11 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
+from unittest.mock import Mock, patch
+
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -124,6 +128,47 @@ class TestFloorMask(unittest.TestCase):
         ad._reject_below_table([_det(900, 850.0)], frame_height=1080)
         ad.reset()
         self.assertEqual(ad.floor_rejected_count, 0)
+
+
+class TestInferenceConfiguration(unittest.TestCase):
+    def test_half_and_device_forwarded_and_missing_clears_candidates(self):
+        with tempfile.NamedTemporaryFile(suffix=".pt") as weights:
+            adapter = YOLOAdapter(weights.name, imgsz=640, device="0", half=True)
+            model = Mock(return_value=[])
+            frame = np.zeros((80, 100, 3), dtype=np.uint8)
+            with patch.object(adapter, "_ensure_model", return_value=model), patch.object(
+                adapter, "_extract_detections", side_effect=[[_det(30, 40)], []]
+            ):
+                first = adapter.predict_frame(frame, 0, 0.0)
+                self.assertTrue(first.ball.visible)
+                self.assertEqual(len(adapter.candidates_for(0)), 1)
+                # Seeking/retrying may reuse a frame ID; no old candidates may survive.
+                second = adapter.predict_frame(frame, 0, 0.0)
+                self.assertFalse(second.ball.visible)
+                self.assertEqual(adapter.candidates_for(0), [])
+            kwargs = model.call_args.kwargs
+            self.assertEqual(kwargs["imgsz"], 640)
+            self.assertEqual(kwargs["device"], "0")
+            self.assertTrue(kwargs["half"])
+            self.assertTrue(adapter.describe()["half"])
+
+    def test_fp32_remains_default(self):
+        with tempfile.NamedTemporaryFile(suffix=".pt") as weights:
+            adapter = YOLOAdapter(weights.name)
+            self.assertFalse(adapter.half)
+            self.assertEqual(adapter._precision_kwargs, {})
+
+    def test_half_uses_supported_ultralytics_precision_argument(self):
+        from types import SimpleNamespace
+        for config, expected in [({}, {"half": True}), ({"quantize": None}, {"quantize": 16})]:
+            with self.subTest(config=config), tempfile.NamedTemporaryFile(suffix=".pt") as weights:
+                adapter = YOLOAdapter(weights.name, half=True)
+                with patch.dict(sys.modules, {
+                    "ultralytics": SimpleNamespace(YOLO=Mock()),
+                    "ultralytics.cfg": SimpleNamespace(DEFAULT_CFG_DICT=config),
+                }):
+                    adapter._ensure_model()
+                self.assertEqual(adapter._precision_kwargs, expected)
 
 
 if __name__ == "__main__":

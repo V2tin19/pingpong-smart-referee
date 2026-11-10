@@ -9,9 +9,11 @@ tools/compare_weights_benchmark.py
 统计指标：
 - Recall@5px, @10px, @20px, @25px, @50px
 - MAE (Mean Absolute Error) / RMSE
-- Precision (基于无球帧的真实误报率)
-- False Positives (无球帧上的虚假检出数)
-- 运行速度 (FPS)
+- Precision（仅覆盖有明确标注的帧；缺项 UNKNOWN 不计入）
+- False Positives（明确不可见标注上的检出，不等于全片真实无球虚警率）
+- 解码与有标注帧推理的混合吞吐（不是纯推理 FPS）
+
+输入尺寸优化请用 benchmark_input_sizes.py：包含独立耗时、预热与基准筛选。
 """
 
 from __future__ import annotations
@@ -27,37 +29,43 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.geometry import preset
 
 
-def load_ground_truth(zip_path: str, max_frame: int = 6002) -> Dict[int, Tuple[float, float]]:
+def load_ground_truth(zip_path: str, max_frame: int = 6002) -> Dict[int, Optional[Tuple[float, float]]]:
     with zipfile.ZipFile(zip_path) as z:
         raw = json.loads(z.read("ball_markup.json").decode("utf-8"))
     gt = {}
     for k, v in raw.items():
         f = int(k)
-        if f < max_frame and v and v.get("x", -1) >= 0 and v.get("y", -1) >= 0:
-            gt[f] = (float(v["x"]), float(v["y"]))
+        if f < max_frame:
+            gt[f] = ((float(v["x"]), float(v["y"]))
+                     if v and v.get("x", -1) >= 0 and v.get("y", -1) >= 0 else None)
     return gt
 
 
 def evaluate_model(
     model_path: str,
     video_path: str,
-    gt_dict: Dict[int, Tuple[float, float]],
+    gt_dict: Dict[int, Optional[Tuple[float, float]]],
     preset_name: str = "test4",
     imgsz: int = 960,
     conf_thresh: float = 0.18,
     max_frames: int = 6002,
 ) -> Dict[str, float]:
+    from ultralytics import YOLO
+
     calib = preset(preset_name)
-    roi = calib.roi_box
     model = YOLO(model_path)
 
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        cap.release()
+        raise ValueError(f"Cannot open video: {video_path}")
+    roi = calib.scaled_to(int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                          int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))).roi_box
     total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     n_frames = min(total_video_frames, max_frames)
 
@@ -69,7 +77,8 @@ def evaluate_model(
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     # 统计项
-    total_gt = len(gt_dict)
+    total_gt = sum(point is not None for fid, point in gt_dict.items() if fid < n_frames)
+    decoded_frames = 0
     gt_frames_evaluated = 0
     non_gt_frames_evaluated = 0
 
@@ -90,7 +99,11 @@ def evaluate_model(
         if not ret:
             break
 
-        is_gt = frame_id in gt_dict
+        decoded_frames += 1
+        # 稀疏标注缺项是 UNKNOWN，不是无球。只对有明确标注的帧计分。
+        if frame_id not in gt_dict:
+            continue
+        is_gt = gt_dict[frame_id] is not None
         if is_gt:
             gt_frames_evaluated += 1
         else:
@@ -135,9 +148,12 @@ def evaluate_model(
 
     cap.release()
     elapsed = time.time() - t0
+    if decoded_frames != n_frames:
+        raise RuntimeError(f"Incomplete video decode: {decoded_frames}/{n_frames}; evaluation rejected")
 
-    mae = float(np.mean(errors)) if errors else 0.0
-    rmse = float(np.sqrt(np.mean(np.square(errors)))) if errors else 0.0
+    # 没有可计算定位误差的检出时显示 nan，而不是虚构完美的 0px。
+    mae = float(np.mean(errors)) if errors else math.nan
+    rmse = float(np.sqrt(np.mean(np.square(errors)))) if errors else math.nan
     total_detections = detected_on_gt + false_positives
     precision_25 = (hits_25 / total_detections * 100.0) if total_detections > 0 else 0.0
 
@@ -188,7 +204,9 @@ def main():
 
     print(f"Loading Ground Truth from {args.zip} (up to {args.max_frames} frames)...")
     gt = load_ground_truth(args.zip, max_frame=args.max_frames)
-    print(f"Loaded {len(gt)} labeled frames with valid ball positions.")
+    print(f"Loaded {sum(point is not None for point in gt.values())} visible labels, "
+          f"{sum(point is None for point in gt.values())} invisible labels; unknown frames excluded.")
+    print("注意：不可见标注不等于物理无球；FPS包含全片解码，不是纯推理速度。")
 
     print("\n" + "=" * 70)
     print("Evaluating Model A: 当前在用 clean_best.pt")
@@ -222,10 +240,10 @@ def main():
     print("-" * 78)
     print(f"{'平均定位误差 (MAE)':<26} | {res_a['mae']:.2f} px {'':<14} | {res_b['mae']:.2f} px")
     print(f"{'均方根误差 (RMSE)':<26} | {res_a['rmse']:.2f} px {'':<14} | {res_b['rmse']:.2f} px")
-    print(f"{'无球帧误报数 (FP)':<26} | {res_a['false_positives']} 帧 ({res_a['fp_rate_pct']:.2f}%) {'':<6} | {res_b['false_positives']} 帧 ({res_b['fp_rate_pct']:.2f}%)")
+    print(f"{'不可见标注帧检出 (FP)':<26} | {res_a['false_positives']} 帧 ({res_a['fp_rate_pct']:.2f}%) {'':<6} | {res_b['false_positives']} 帧 ({res_b['fp_rate_pct']:.2f}%)")
     print(f"{'总体查准率 Precision@25px':<26} | {res_a['precision_25']:.2f}% {'':<15} | {res_b['precision_25']:.2f}%")
     print(f"{'检出平均置信度':<26} | {res_a['mean_conf']:.3f} {'':<17} | {res_b['mean_conf']:.3f}")
-    print(f"{'纯推理速度 (FPS)':<26} | {res_a['fps']:.1f} FPS {'':<14} | {res_b['fps']:.1f} FPS")
+    print(f"{'全片解码+标注帧推理 FPS':<26} | {res_a['fps']:.1f} FPS {'':<14} | {res_b['fps']:.1f} FPS")
     print("#" * 78)
 
 

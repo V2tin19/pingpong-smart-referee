@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -33,13 +34,36 @@ import cv2
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
-from core.evidence_adjudicator import EvidenceStateMachine, RallyDecision
+from core.evidence_adjudicator import EvidenceStateMachine
 from core.geometry import guess_preset_name, preset
 from core.homography import TableHomography
 from core.schemas import EventType, FrameObservation
 from core.state_machine import MatchRules, TableTennisStateMachine
 from core.trajectory_processor import TrajectoryEventProcessor
 from visualizer.broadcast_hud import BroadcastHUD, HUDState
+
+
+def render_config(width, height, fps, scale=1.0, render_fps=None):
+    """Validate rendering and retain requested fractional rates without speeding up video."""
+    if width <= 0 or height <= 0 or not math.isfinite(fps) or fps <= 0:
+        raise ValueError("Invalid video dimensions or FPS")
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError("render_scale must be finite and positive")
+    output_fps = fps if render_fps is None else render_fps
+    if not math.isfinite(output_fps) or not 0 < output_fps <= fps:
+        raise ValueError("render_fps must be positive and no greater than source FPS")
+    output_width = int(round(width * scale / 2.0)) * 2
+    output_height = int(round(height * scale / 2.0)) * 2
+    if min(output_width, output_height) < 2:
+        raise ValueError("Rendered dimensions must be at least 2 pixels")
+    return output_width, output_height, output_fps
+
+
+def should_render_frame(frame_id, source_fps, output_fps):
+    # e.g. 120 -> 50 cannot use round(120/50)=2 (would write 60 frames at 50 fps).
+    return frame_id == 0 or math.floor(frame_id * output_fps / source_fps + 1e-9) > math.floor(
+        (frame_id - 1) * output_fps / source_fps + 1e-9
+    )
 
 
 def run_from_jsonl(
@@ -74,10 +98,7 @@ def run_from_jsonl(
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         homography = TableHomography(calib, image_size=(w, h))
 
-    out_w = int(round(w * render_scale / 2.0)) * 2
-    out_h = int(round(h * render_scale / 2.0)) * 2
-    out_fps = render_fps or fps
-    frame_step = max(1, int(round(fps / out_fps)))
+    out_w, out_h, out_fps = render_config(w, h, fps, render_scale, render_fps)
 
     if output_path and cap:
         out_dir = os.path.dirname(os.path.abspath(output_path))
@@ -154,7 +175,7 @@ def run_from_jsonl(
             # 渲染视频 HUD
             if cap and writer:
                 ok, frame = cap.read()
-                if ok and (obs.frame_id % frame_step == 0):
+                if ok and should_render_frame(obs.frame_id, fps, out_fps):
                     current = processor.trajectory[-1] if processor.trajectory else None
                     if adjudicator == "evidence" and evidence_sm is not None:
                         hud_score = (evidence_sm.points["A"], evidence_sm.points["B"])
@@ -217,6 +238,8 @@ def run_from_video(
     floor_margin_px: Optional[float] = None,
     render_scale: float = 1.0,
     render_fps: Optional[float] = None,
+    device: Optional[str] = None,
+    half: bool = False,
 ) -> int:
     from adapters.yolo_adapter import YOLOAdapter
 
@@ -233,6 +256,13 @@ def run_from_video(
     processor = TrajectoryEventProcessor(calib, source="yolo")
 
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        cap.release()
+        print(f"[错误] 无法打开视频: {video_path}")
+        return 1
+    if max_frames is not None and max_frames <= 0:
+        cap.release()
+        raise ValueError("max_frames must be positive")
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 120.0
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -247,13 +277,12 @@ def run_from_video(
         floor_margin_px=floor_margin_px,
         imgsz=imgsz,
         conf_threshold=conf,
+        device=device,
+        half=half,
         strict_time=True,
     )
 
-    out_w = int(round(w * render_scale / 2.0)) * 2
-    out_h = int(round(h * render_scale / 2.0)) * 2
-    out_fps = render_fps or fps
-    frame_step = max(1, int(round(fps / out_fps)))
+    out_w, out_h, out_fps = render_config(w, h, fps, render_scale, render_fps)
 
     writer = None
     hud = None
@@ -283,7 +312,7 @@ def run_from_video(
     print(f"机位预设: {preset_name} (球网X像素: {calib.net_x})")
     print(f"模型权重: {os.path.basename(weights_path)}")
     if output_path:
-        print(f"渲染配置: {out_w}x{out_h} @ {out_fps:.1f}fps (抽帧步长: {frame_step}, 比例: {render_scale:.2f})")
+        print(f"渲染配置: {out_w}x{out_h} @ {out_fps:.1f}fps (时间比例采样, 比例: {render_scale:.2f})")
     print("=" * 72)
 
     for frame_id in range(n_frames):
@@ -335,7 +364,7 @@ def run_from_video(
                     print(f"  [帧 {frame_id:04d} | {t:6.3f}s] >> [回合证据引擎] {ev_decision.describe()}")
 
         # HUD 渲染 (仅在采样输出帧时执行)
-        if writer and hud and (frame_id % frame_step == 0):
+        if writer and hud and should_render_frame(frame_id, fps, out_fps):
             current = processor.trajectory[-1] if processor.trajectory else None
             if adjudicator == "evidence" and evidence_sm is not None:
                 hud_score = (evidence_sm.points["A"], evidence_sm.points["B"])
@@ -389,7 +418,7 @@ def run_from_video(
 def main():
     parser = argparse.ArgumentParser(description="乒乓球视觉智能裁判系统 · 统一入口")
     parser.add_argument("--jsonl", default=None, help="输入统一逐帧观测 JSONL 文件路径")
-    parser.add_argument("--video", default=None, help="输入视频或摄像头设备路径")
+    parser.add_argument("--video", default=None, help="输入本地视频文件路径（当前入口尚不支持相机/RTSP）")
     parser.add_argument("--weights", default="weights/yolo11n_clean_best.pt", help="YOLO 权重路径 (视频模式必填)")
     parser.add_argument("--preset", default=None, help="球台机位预设 (test2, game2, rally, plos)")
     parser.add_argument("--adjudicator", choices=["legacy", "evidence", "shadow"], default="shadow",
@@ -399,6 +428,8 @@ def main():
     parser.add_argument("--max-frames", type=int, default=None, help="最大处理帧数限制")
     parser.add_argument("--imgsz", type=int, default=960, help="YOLO 推理尺寸 (默认: 960)")
     parser.add_argument("--conf", type=float, default=0.18, help="YOLO 检测阈值 (默认: 0.18)")
+    parser.add_argument("--device", default=None, help="推理设备，例如 0 / cpu（默认自动选择）")
+    parser.add_argument("--half", action="store_true", help="显式启用FP16；需在目标硬件单独验证精度")
     parser.add_argument("--reject-floor", type=float, default=None, metavar="PX",
                         help="感知降噪：丢弃球台近边以下 PX 像素的地面检出 (Test4 建议 30；默认关)")
     parser.add_argument("--strict-rally-hit", action="store_true", default=False,
@@ -440,6 +471,8 @@ def main():
             preset_name=preset_name,
             imgsz=args.imgsz,
             conf=args.conf,
+            device=args.device,
+            half=args.half,
             output_path=args.output,
             export_jsonl=args.export_jsonl,
             max_frames=args.max_frames,

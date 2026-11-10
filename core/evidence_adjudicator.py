@@ -128,7 +128,10 @@ class RallyBuffer:
                     for h in self.hits
                 )
                 if not intervening_hit:
-                    min_c = min(b1.confidence or 0.8, b2.confidence or 0.8)
+                    min_c = min(
+                        b1.confidence if b1.confidence is not None else 0.8,
+                        b2.confidence if b2.confidence is not None else 0.8,
+                    )
                     return (b1.side, min_c, b1, b2)
         return None
 
@@ -187,7 +190,10 @@ class HypothesisJudge:
             ]
             if subsequent_bounce and subsequent_bounce[0].side == receiver:
                 serve_net_let_matched = True
-                c_net = min(net_ev.confidence or 0.8, subsequent_bounce[0].confidence or 0.8)
+                c_net = min(
+                    net_ev.confidence if net_ev.confidence is not None else 0.8,
+                    subsequent_bounce[0].confidence if subsequent_bounce[0].confidence is not None else 0.8,
+                )
                 add_rule(
                     "SERVE_NET_LET", AdjudicationOutcome.LET, 3.5, c_net,
                     f"发球擦网后成功落在接发方({receiver})半台，判定擦网重发",
@@ -217,7 +223,7 @@ class HypothesisJudge:
             # 如果最后一次有效落台在台内
             d_edge = last_b.distance_to_edge_cm if last_b.distance_to_edge_cm is not None else 5.0
             if d_edge >= 0 and not db:
-                c_b = last_b.confidence or 0.8
+                c_b = last_b.confidence if last_b.confidence is not None else 0.8
                 # 检查最后一次击球是否在最后落台之前
                 hit_before_last_b = (last_h is None or last_h.timestamp_s < last_b.timestamp_s)
                 if hit_before_last_b:
@@ -235,9 +241,29 @@ class HypothesisJudge:
         # ---- 规则 4：落台在台外出界 (OUT / OFF_TABLE) -------------------------
         last_out = buffer.outs[-1] if buffer.outs else None
         if last_out:
-            c_out = last_out.confidence or 0.7
+            c_out = last_out.confidence if last_out.confidence is not None else 0.7
             last_h = buffer.hits[-1] if buffer.hits else None
-            if last_h:
+            last_b = buffer.bounces[-1] if buffer.bounces else None
+            hitter = last_h.side if last_h else buffer.server
+            # OUT 也可能是合法落台后无人回击、球掉到地板的反弹。
+            # 此时出界并非击球方失误；必须先检查同次击球的合法落台证据。
+            landed_on_receiver = (
+                last_b is not None
+                and hitter in ("A", "B")
+                and last_b.side in ("A", "B")
+                and last_b.side != hitter
+                and (last_h is None or last_h.timestamp_s < last_b.timestamp_s)
+                and last_b.timestamp_s <= last_out.timestamp_s
+                and (last_b.distance_to_edge_cm is None or last_b.distance_to_edge_cm >= 0)
+            )
+            if landed_on_receiver:
+                c_b = last_b.confidence if last_b.confidence is not None else 0.8
+                target = AdjudicationOutcome.POINT_A if hitter == "A" else AdjudicationOutcome.POINT_B
+                add_rule(
+                    "OUT_AFTER_LEGAL_BOUNCE", target, 3.0, min(c_out, c_b),
+                    f"球合法落在 {last_b.side} 侧后未被回击，随后落到台外",
+                )
+            elif last_h:
                 if last_h.side == "A":
                     add_rule("OUT_BY_A", AdjudicationOutcome.POINT_B, 3.0, c_out, "A方击球出界")
                 elif last_h.side == "B":
@@ -251,7 +277,7 @@ class HypothesisJudge:
             last_b = buffer.bounces[-1]
             d_edge = last_b.distance_to_edge_cm
             if d_edge is not None and d_edge < -self.out_margin_cm:
-                c_b = last_b.confidence or 0.7
+                c_b = last_b.confidence if last_b.confidence is not None else 0.7
                 last_h = buffer.hits[-1] if buffer.hits else None
                 if last_h:
                     if last_h.side == "A":
@@ -267,6 +293,9 @@ class HypothesisJudge:
         # ---- 规则 5：击球后落回己方半台 (OWN_COURT，不含发球自落) ------------
         for i in range(len(buffer.hits)):
             h = buffer.hits[i]
+            # UNKNOWN 是信息缺失，不能将两个 UNKNOWN 当成同一位球员。
+            if h.side not in ("A", "B"):
+                continue
             # 若是发球方的第一次击球 (发球)，其落在己方半台是合法发球动作，不判失误
             if i == 0 and h.side == buffer.server:
                 continue
@@ -279,7 +308,10 @@ class HypothesisJudge:
                     for h2 in buffer.hits
                 )
                 if not intervening_opp_hit and first_b.side == h.side:
-                    c_own = min(h.confidence or 0.8, first_b.confidence or 0.8)
+                    c_own = min(
+                        h.confidence if h.confidence is not None else 0.8,
+                        first_b.confidence if first_b.confidence is not None else 0.8,
+                    )
                     opp = AdjudicationOutcome.POINT_B if h.side == "A" else AdjudicationOutcome.POINT_A
                     add_rule(
                         f"OWN_COURT_{h.side}", opp, 2.2, c_own,
@@ -380,14 +412,16 @@ class EvidenceStateMachine:
     # ------------------------------------------------------------------
     def update(self, event: RefereeEvent) -> List[RallyDecision]:
         """接收一个物理事件，驱动状态转移。"""
+        if self.game_over:
+            return []
         t = event.timestamp_s
         self._last_event_time = t
         out_decisions: List[RallyDecision] = []
 
         if self.phase == RallyPhase.PREP:
             # 准备期：进滑动窗口自然过期
-            self._prep_window.append(event)
             self._prune_prep_window(t)
+            self._prep_window.append(event)
 
             # 检查是否发生【球第一次越网】
             crossing = self._detect_net_crossing(event)
@@ -452,6 +486,8 @@ class EvidenceStateMachine:
 
     def tick(self, t: float) -> List[RallyDecision]:
         """时钟推进：驱动准备期窗口过期与回合超时结算。"""
+        if self.game_over:
+            return []
         if self.phase == RallyPhase.PREP:
             self._prune_prep_window(t)
             return []
@@ -529,6 +565,9 @@ class EvidenceStateMachine:
         cutoff = t - self.prep_window_s
         while self._prep_window and self._prep_window[0].timestamp_s < cutoff:
             self._prep_window.popleft()
+        if not self._prep_window:
+            # 越网方向的前一采样也必须与准备窗口一同过期。
+            self._last_ball_x = None
 
     # ------------------------------------------------------------------
     # 状态结算与流转

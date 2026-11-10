@@ -3,6 +3,10 @@
 602Lab 乒乓球视觉智能裁判系统的**共用裁判核心层（Core Engine）与硬件对接仓库**。  
 依据组长下发的权威方案《TTNet、TrackNet、YOLO 共用计分状态机方案》实现。系统负责接收前端多源感知算法（YOLO / TrackNet / TTNet）产出的**统一逐帧观测（Observation）**，并结合**物理硬件实体按键**，完成全自动轨迹滤波、物理事件判定、球台落点单应性解算、6状态计分流转与转播级比分看板渲染。
 
+> 2026-11-10 接手审查与实测结论见 [健康检查与部署优化报告](docs/project_health_20261110.md)。
+> 当前保留默认 `imgsz=960`；两个机位完整标注实测表明，640/512 明显损失召回，832 也未满足跨场景零退化。
+> 运行入口目前支持本地视频文件/JSONL；相机、RTSP 和 GPIO/UART 驱动仍是下一阶段工程，不是已交付能力。
+
 ---
 
 ## 一、 系统架构
@@ -59,7 +63,7 @@ pingpong/
 ├── examples/                     # 免视频、免模型的即用型观测测试数据
 │   ├── sample_tracknet_600f.jsonl# TrackNet 分支 600 帧真实比赛观测流
 │   └── sample_yolo_300f.jsonl    # YOLO 分支 300 帧真实比赛观测流
-├── tests/                        # 自动化测试套件 (198 项单元测试通过)
+├── tests/                        # 自动化测试套件 (执行命令见下文，以当前结果为准)
 │   ├── test_contracts.py         # 数据契约校验测试
 │   ├── test_state_machine.py     # 状态机判罚规则与四条门控单测 (含生活流长会话回归)
 │   ├── test_trajectory_processor.py # 轨迹平滑、事件提取与瞬移守卫单测
@@ -131,7 +135,7 @@ python run_referee.py --jsonl examples/sample_yolo_300f.jsonl --preset game2
 > **宁可漏判，不可误判**。
 
 ### 3. 模式 B：端到端视频推理并渲染比分看板
-适用于本地有视频文件或摄像头输入，调用 YOLO 适配器推理并渲染转播视频：
+适用于本地视频文件，调用 YOLO 适配器推理并渲染转播视频（相机输入尚未接入）：
 
 ```bash
 python run_referee.py \
@@ -141,10 +145,24 @@ python run_referee.py \
     --output output/demo_referee.mp4
 ```
 
-### 4. 运行完整自动化测试
+### 4. 输入尺寸与硬件优化评测
+
+使用已有视觉环境执行（只做检测评测，不渲染/降采集帧率）：
+
+```bash
+python tools/benchmark_input_sizes.py --video data/test_4_50s.mp4 --annotations data/test_4.zip --weights weights/yolo11n_game1_best.pt --preset test4 --sizes 960 832 768 640 512 --device 0 --output output/input_sizes.json
+```
+
+- 不传 `--sample-count` 默认评测全部可用标注；抽样只用于冒烟，不用于验收。
+- 缺失标注不当作无球；负坐标仅为不可见/不可定位标注，不代表已人工确认无球。
+- 输出原图像素误差、Recall@5/10/25px、预热后适配器耗时及逐帧结果。
+- `--half` 是独立 FP16 实验；生产入口也支持 `--device` / `--half`，但默认仍为 FP32、960。
+- 单机稀疏帧耗时不等于实际部署端到端 FPS，必须补目标硬件连续录像与判罚回放验收。
+
+### 5. 运行完整自动化测试
 ```bash
 python -m unittest discover -s tests -p "test_*.py"
-# 预期输出：Ran 198 tests ... OK
+# 预期输出：Ran ... tests ... OK（数量随新增回归更新）
 ```
 
 ---

@@ -360,6 +360,7 @@ class TrajectoryEventProcessor:
         self._kalman = _ClockDrivenKalman()
         self._trajectory: Deque[TrackPoint] = deque(maxlen=self._params.max_trajectory_points)
         self._vel_history: Deque[Tuple[float, float, float]] = deque(maxlen=10)
+        self._segment_start_time: Optional[float] = None
 
         self._last_timestamp: Optional[float] = None
         self._last_prediction: Optional[Tuple[float, float]] = None
@@ -589,6 +590,7 @@ class TrajectoryEventProcessor:
         vx = (pos[0] - tn.x) / max(gap, 1e-6)
         vy = (pos[1] - tn.y) / max(gap, 1e-6)
         self._kalman.initialize(pos[0], pos[1], vx, vy)
+        self._segment_start_time = tn.timestamp_s
         # 关键修复：确认帧的 predict() 发生在初始化**之前**，_last_prediction
         # 仍为 None——下一帧的候选选择会误入"未跟踪"分支（距离盲选、只看
         # 置信度），远处高置信误检（台面热点）将**劫持刚建立的跟踪**。
@@ -668,13 +670,24 @@ class TrajectoryEventProcessor:
         self._static_since = None
         self._static_ref = None
         self._last_raw = None
+        self._last_prediction = None
+        self._last_measured = None
+        self._tentative = None
+        self._vel_history.clear()
+        self._segment_start_time = None
+
+    def _segment_trajectory(self) -> List[TrackPoint]:
+        """只给物理判据当前连续段，跨段旧点仍保留给可视化。"""
+        if self._segment_start_time is None:
+            return []
+        return [p for p in self._trajectory if p.timestamp_s >= self._segment_start_time]
 
     # ------------------------------------------------------------------
     # 3. 防尖刺
     # ------------------------------------------------------------------
     def _apply_anti_spike(self, params: ProcessorParams) -> None:
         """三点曲率防尖刺：中点偏离首尾中点过远且首尾跨度不大时，拉回中点。"""
-        pts = [p for p in self._trajectory if p.is_observed]
+        pts = [p for p in self._segment_trajectory() if p.is_observed]
         if len(pts) < 3:
             return
         a, b, c = pts[-3], pts[-2], pts[-1]
@@ -724,9 +737,9 @@ class TrajectoryEventProcessor:
             v_prev_mag = math.hypot(vx_prev, vy_prev)
             dv_mag = math.hypot(vx_curr - vx_prev, vy_curr - vy_prev)
             dv_ratio = dv_mag / max(v_prev_mag, 1.0)
-            recent_traj = list(self._trajectory)[-10:]
+            recent_traj = self._segment_trajectory()[-10:]
             gap_cnt = sum(1 for p in recent_traj if not p.is_observed)
-            det_conf = point.confidence or 0.8
+            det_conf = point.confidence if point.confidence is not None else 0.8
 
             # 击球物理置信度计算: c_hit = det_conf * min(1, dv_ratio / r_ref) * (1 - lambda * gap)
             r_ref = 0.5
@@ -749,9 +762,9 @@ class TrajectoryEventProcessor:
             v_prev_mag = math.hypot(vx_prev, vy_prev)
             dv_mag = math.hypot(vx_curr - vx_prev, vy_curr - vy_prev)
             dv_ratio = dv_mag / max(v_prev_mag, 1.0)
-            recent_traj = list(self._trajectory)[-10:]
+            recent_traj = self._segment_trajectory()[-10:]
             gap_cnt = sum(1 for p in recent_traj if not p.is_observed)
-            det_conf = point.confidence or 0.8
+            det_conf = point.confidence if point.confidence is not None else 0.8
 
             # 落台 vs 出界判定：在物理厘米空间进行
             # - 距离台边 >= -params.out_margin_cm（含台内与擦边容差区）：报 BOUNCE 并携带真实的带符号 d_edge
@@ -823,7 +836,7 @@ class TrajectoryEventProcessor:
         if vy_prev > params.bounce_vy_down and vy_curr < params.bounce_vy_up:
             return True
         # 兜底：最近 5 个观测点的 y 呈"先降后升"的局部极大
-        obs = [p for p in self._trajectory if p.is_observed][-5:]
+        obs = [p for p in self._segment_trajectory() if p.is_observed][-5:]
         if len(obs) == 5:
             ys = [p.y for p in obs]
             if ys[2] >= ys[0] + 2 and ys[2] >= ys[1] and ys[2] >= ys[3] and ys[2] >= ys[4] + 2:

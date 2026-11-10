@@ -144,6 +144,100 @@ class TestEvidenceAdjudicator(unittest.TestCase):
         self.assertEqual(self.sm.points["A"], 0)
         self.assertEqual(self.sm.points["B"], 1)
 
+    def _admit_serve(self, sm=None):
+        sm = sm or self.sm
+        sm.update(self._event("RACKET_HIT", "A", 0.8, pos_px=(500.0, 520.0)))
+        sm.update(self._event("BOUNCE", "A", 1.0, pos_px=(700.0, 540.0)))
+        sm.update(self._event("BOUNCE", "B", 1.3, pos_px=(1100.0, 540.0)))
+        self.assertEqual(sm.phase, RallyPhase.RALLY)
+
+    def test_floor_out_after_legal_serve_bounce_awards_server(self):
+        """台内未回击后掉到地板的 OUT 不能反判成发球出界。"""
+        self._admit_serve()
+        decision = self.sm.update(self._event(
+            "OUT", "B", 1.6, pos_px=(1300.0, 750.0), d_edge=-15.0,
+        ))[0]
+        self.assertEqual(decision.outcome, AdjudicationOutcome.POINT_A)
+        self.assertIn("OUT_AFTER_LEGAL_BOUNCE", [r.rule_name for r in decision.matched_rules])
+
+    def test_floor_out_after_legal_return_awards_last_hitter(self):
+        self._admit_serve()
+        self.sm.update(self._event("RACKET_HIT", "B", 1.5, pos_px=(1300.0, 520.0)))
+        self.sm.update(self._event("BOUNCE", "A", 1.7, pos_px=(700.0, 540.0)))
+        decision = self.sm.update(self._event(
+            "OUT", "A", 2.0, pos_px=(500.0, 750.0), d_edge=-15.0,
+        ))[0]
+        self.assertEqual(decision.outcome, AdjudicationOutcome.POINT_B)
+
+    def test_unknown_hit_and_bounce_do_not_score_own_court(self):
+        self._admit_serve()
+        self.sm.update(self._event("RACKET_HIT", "UNKNOWN", 1.5, pos_px=(1100.0, 530.0)))
+        self.sm.update(self._event("BOUNCE", "UNKNOWN", 1.7, pos_px=(1100.0, 540.0)))
+        decision = self.sm.tick(2.6)[0]
+        self.assertEqual(decision.outcome, AdjudicationOutcome.INVALID)
+        self.assertNotIn("OWN_COURT_UNKNOWN", [r.rule_name for r in decision.matched_rules])
+        self.assertEqual(self.sm.points, {"A": 0, "B": 0})
+
+    def test_game_over_ignores_more_events_until_revoke(self):
+        sm = EvidenceStateMachine(self.calib, points_to_win=1, win_by=1)
+        self._admit_serve(sm)
+        sm.update(self._event("BOUNCE", "B", 1.6, pos_px=(1200.0, 540.0)))
+        self.assertTrue(sm.game_over)
+        for kind, side, t, x in [
+            ("BOUNCE", "A", 3.0, 700.0),
+            ("BOUNCE", "B", 3.3, 1100.0),
+            ("BOUNCE", "B", 3.6, 1200.0),
+        ]:
+            self.assertEqual(sm.update(self._event(kind, side, t, pos_px=(x, 540.0))), [])
+        self.assertEqual(sm.tick(5.0), [])
+        self.assertEqual(sm.points, {"A": 1, "B": 0})
+        self.assertEqual(len(sm._decisions_history), 1)
+        self.assertTrue(sm.revoke_last_point())
+        self.assertFalse(sm.game_over)
+        self._admit_serve(sm)
+        self.assertEqual(sm.phase, RallyPhase.RALLY)
+
+    def test_expired_prep_sample_cannot_create_a_net_crossing(self):
+        for use_tick in (False, True):
+            with self.subTest(use_tick=use_tick):
+                sm = EvidenceStateMachine(self.calib)
+                sm.update(self._event("BOUNCE", "A", 1.0, pos_px=(700.0, 540.0)))
+                if use_tick:
+                    sm.tick(10.0)
+                sm.update(self._event("BOUNCE", "B", 11.0, pos_px=(1100.0, 540.0)))
+                self.assertEqual(sm.phase, RallyPhase.PREP)
+                self.assertEqual(sm.tick(12.0), [])
+                self.assertEqual(sm.points, {"A": 0, "B": 0})
+
+    def test_zero_confidence_double_bounce_is_not_promoted(self):
+        self._admit_serve()
+        decision = self.sm.update(self._event(
+            "BOUNCE", "B", 1.6, pos_px=(1200.0, 540.0), conf=0.0,
+        ))[0]
+        self.assertEqual(decision.outcome, AdjudicationOutcome.INVALID)
+        self.assertEqual(decision.matched_rules[0].min_event_conf, 0.0)
+        self.assertEqual(self.sm.points, {"A": 0, "B": 0})
+
+    def test_zero_confidence_stays_zero_for_each_judge_rule(self):
+        cases = [
+            ("UNRETURNED_IN_B", [self._event("BOUNCE", "B", 1.0, conf=0.0)]),
+            ("SERVE_OUT_A", [self._event("OUT", "B", 1.0, conf=0.0)]),
+            ("SERVE_OFF_TABLE_A", [self._event("BOUNCE", "B", 1.0, conf=0.0, d_edge=-15.0)]),
+            ("OWN_COURT_B", [self._event("RACKET_HIT", "B", 1.0, conf=0.0),
+                             self._event("BOUNCE", "B", 1.3)]),
+            ("SERVE_NET_LET", [self._event("NET_TOUCH", "A", 1.0, conf=0.0),
+                              self._event("BOUNCE", "B", 1.3)]),
+        ]
+        for rule_name, events in cases:
+            with self.subTest(rule=rule_name):
+                buffer = RallyBuffer(round_id=1, server="A")
+                for event in events:
+                    buffer.append(event)
+                decision = HypothesisJudge().adjudicate(buffer, (0, 0))
+                rule = next(r for r in decision.matched_rules if r.rule_name == rule_name)
+                self.assertEqual(rule.min_event_conf, 0.0)
+                self.assertEqual(rule.score, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

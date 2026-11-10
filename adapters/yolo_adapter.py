@@ -90,6 +90,9 @@ class YOLOAdapter(BaseAdapter):
     device:
         ``None`` 表示交给 Ultralytics 自动选（有 GPU 用 GPU）；
         也可显式传 ``"0"`` / ``"cpu"``。
+    half:
+        显式启用 FP16（默认关闭）；仅适用于支持半精度的推理设备/后端，
+        需独立于输入尺寸变化做精度验证。
     max_candidates:
         单帧最多保留多少个候选，防止极端画面下候选爆炸。
     strict_time:
@@ -117,6 +120,7 @@ class YOLOAdapter(BaseAdapter):
         conf_threshold: float = 0.18,
         iou_threshold: float = 0.45,
         device: Optional[str] = None,
+        half: bool = False,
         max_candidates: int = 8,
         strict_time: bool = False,
     ) -> None:
@@ -162,6 +166,8 @@ class YOLOAdapter(BaseAdapter):
         self.conf_threshold = float(conf_threshold)
         self.iou_threshold = float(iou_threshold)
         self.device = device
+        self.half = bool(half)
+        self._precision_kwargs: Dict[str, Any] = {"half": True} if self.half else {}
         self.max_candidates = int(max_candidates)
 
         # 惰性加载：import ultralytics 与加载权重都推迟到第一次推理，
@@ -190,6 +196,7 @@ class YOLOAdapter(BaseAdapter):
                 "conf_threshold": self.conf_threshold,
                 "iou_threshold": self.iou_threshold,
                 "device": self.device,
+                "half": self.half,
                 "floor_margin_px": self._floor_margin_px,
                 "floor_rejected": self.floor_rejected_count,
                 "calibration": (
@@ -223,7 +230,11 @@ class YOLOAdapter(BaseAdapter):
     def _ensure_model(self) -> Any:
         if self._model is None:
             from ultralytics import YOLO  # 局部导入：无 torch 环境也能 import 本模块
+            from ultralytics.cfg import DEFAULT_CFG_DICT
 
+            # 新版以 quantize=16 表示 FP16；旧版继续使用 half=True。
+            if self.half and "quantize" in DEFAULT_CFG_DICT:
+                self._precision_kwargs = {"quantize": 16}
             self._model = YOLO(self.weights_path)
         return self._model
 
@@ -248,6 +259,9 @@ class YOLOAdapter(BaseAdapter):
         else:
             crop, offset = roi.crop(frame)
 
+        # 候选只属于最近一次推理，即便重用同一 frame_id 后漏检也不得泄漏旧框。
+        self._candidates_frame = frame_id
+        self._candidates = []
         self._last_roi_offset = offset
         self._last_crop_size = (int(crop.shape[1]), int(crop.shape[0]))
 
@@ -258,6 +272,7 @@ class YOLOAdapter(BaseAdapter):
             "iou": self.iou_threshold,
             "verbose": False,
         }
+        kwargs.update(self._precision_kwargs)
         if self.device is not None:
             kwargs["device"] = self.device
 

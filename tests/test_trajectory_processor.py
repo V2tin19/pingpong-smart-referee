@@ -460,6 +460,31 @@ class TestFrameRateIndependence(unittest.TestCase):
                 run(proc, frames)
                 self.assertFalse(proc.is_tracking, f"{fps}fps 下应已断轨")
 
+    def test_reacquisition_does_not_compare_velocity_with_previous_track(self):
+        """丢球断轨后的反向新段不能被当成可观测到的击球转向。"""
+        for fps in (25.0, 50.0):
+            with self.subTest(fps=fps):
+                proc = TrajectoryEventProcessor(CALIB)
+                run(proc, [obs(500 + 20 * i, 540, i, fps=fps) for i in range(5)])
+                gap_end = 5 + int(round(0.4 * fps))
+                run(proc, [miss(i, fps=fps) for i in range(5, gap_end)])
+                self.assertFalse(proc.is_tracking)
+                _, events = run(proc, [
+                    obs(1100 - 20 * k, 540, gap_end + k, fps=fps) for k in range(5)
+                ])
+                self.assertTrue(proc.is_tracking)
+                self.assertEqual(events, [], "重捕新段的匀速运动不应产生击球事件")
+                self.assertTrue(any(p.frame_id == 0 for p in proc.trajectory),
+                                "旧轨迹只退出物理判据，不必从渲染缓存删除")
+
+    def test_reacquisition_does_not_form_bounce_with_previous_track(self):
+        proc = TrajectoryEventProcessor(CALIB)
+        run(proc, [obs(500 + 20 * i, 500 + 20 * i, i) for i in range(5)])
+        run(proc, [miss(i) for i in range(5, 15)])
+        self.assertFalse(proc.is_tracking)
+        _, events = run(proc, [obs(1100 + 20 * k, 550 - 20 * k, 15 + k) for k in range(5)])
+        self.assertEqual(events, [], "两个断开的下降/上升段不构成一次落台")
+
     def test_event_count_same_at_both_frame_rates(self):
         """同一物理轨迹（同一 px/s）在两种帧率下应产生相同数量的事件。"""
         counts = {}
