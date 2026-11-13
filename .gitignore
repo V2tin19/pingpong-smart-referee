@@ -28,10 +28,13 @@ data/*.avi
 data/*.zip
 data/roboflow_ball_v7/
 data/game1_dataset/
-data/*_dataset/
+data/*_dataset*/
 output/
 *.mp4
 *.avi
+
+# ---- 交付/打包产物 (不入库) ----
+handoff_*.zip
 
 # ---- 运行日志与测试残留 ----
 *.log

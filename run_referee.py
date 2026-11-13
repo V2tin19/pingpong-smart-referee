@@ -419,7 +419,7 @@ def main():
     parser = argparse.ArgumentParser(description="乒乓球视觉智能裁判系统 · 统一入口")
     parser.add_argument("--jsonl", default=None, help="输入统一逐帧观测 JSONL 文件路径")
     parser.add_argument("--video", default=None, help="输入本地视频文件路径（当前入口尚不支持相机/RTSP）")
-    parser.add_argument("--weights", default="weights/yolo11n_clean_best.pt", help="YOLO 权重路径 (视频模式必填)")
+    parser.add_argument("--weights", default="weights/yolo11n_game1_aug_best.pt", help="YOLO 权重路径 (视频模式必填)")
     parser.add_argument("--preset", default=None, help="球台机位预设 (test2, game2, rally, plos)")
     parser.add_argument("--adjudicator", choices=["legacy", "evidence", "shadow"], default="shadow",
                         help="裁判判分引擎模式：'legacy'(传统即时状态机), 'evidence'(回合级证据假设引擎), 'shadow'(影子双跑对照, 默认)")
