@@ -9,9 +9,11 @@
 | `test_1.mp4` / `test_1.zip` | OpenTTGames 测试视频 1 + 官方标注 |
 | `test_2.mp4` / `test_2.zip` | 连续对拉视频，1920×1080 @ **120fps**（与 game2 同机位，已实测验证）+ 官方标注 |
 | `test_3.mp4` / `test_3.zip` | OpenTTGames 测试视频 3 + 官方标注 |
-| `test_4.mp4` / `test_4.zip` | 深绿台面机位（`docs/test4_evaluation_report.md` 评测对象）+ 官方标注 |
+| `test_4.mp4` / `test_4.zip` | 同场地另一机位/光照（`docs/test4_evaluation_report.md` 评测对象）+ 官方标注 |
 | `test_4_50s.mp4` | test_4 前 50 秒剪辑（6002 帧 @120fps），门控验证与感知降噪的标准切片 |
 | `roboflow_ball_v7/` | Roboflow 开源球检测数据集（训练用）。注意报告 §一 结论：泛杂场景数据反而有害，训练只考虑与测试机位一致的数据 |
+
+> **场地/桌台澄清（2026-11-12 逐帧核实）**：OpenTTGames 全部视频（game_1~game_4 训练、test_1~test_4 测试）均在**同一场地、同一张蓝色球台**录制（蓝帘背景、TT-LIGA.PRO / sportlevel.com 挡板、黄色地面、同款裁判椅与球筐）。test_3 与 test_4 仅**机位角度与光照/曝光**不同。历史文档中"绿台/深绿台面(test_4)"为误标（实为蓝台）；"蓝台 vs 绿台"**不构成跨场地对照**。
 
 > 每个 `*.zip` 内含 `ball_markup.json`（逐帧球心真值）、`events_markup.json`
 > （物理事件标签）与 `segmentation_masks/`。

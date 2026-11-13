@@ -296,7 +296,7 @@ CALIBRATION_PRESETS: Dict[str, TableCalibration] = {
         net_x=880,
         net_zone=(350, 560),
     ),
-    # OpenTTGames Test 4：1080p @ 120fps，深绿台面机位
+    # OpenTTGames Test 4：1080p @ 120fps，同场地另一机位/光照（台面同为蓝色，历史"深绿台面"系误标）
     "test4": TableCalibration(
         name="test4",
         base_width=1920,
